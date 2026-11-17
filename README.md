@@ -1,4 +1,18 @@
-﻿# Sonix Player
+## Disclaimer
+Changes in this fork were vibe coded with Codex. I've tested on my HiBy R1 but I'm not responsible if anything here breaks your device in any way.
+
+## Changes in this Fork
+- Added a classic 'iTunes visualiser' mode
+- Improved thumbnail loading times with some caching and pre-generation changes
+- CoverFlow artwork now loads instantly and I added fade-in-out so it looks smoother when scrolling
+- Album grid view: adds a 4 column cover art grid
+- Most played lists the number of plays for each track
+- Swiping from the cover to the lyrics fades the background (reflection). The way it just popped previously was annoying
+- Added iPod mode (access from lower right menu in now playing), just for fun
+ 
+ ------
+ 
+ # Sonix Player
 
 A replacement player for the **HiBy R3 Pro II** and the **HiBy R1**, written on
 LVGL.
