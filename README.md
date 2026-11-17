@@ -6,6 +6,8 @@ Changes in this fork were vibe coded with Codex. I've tested on my HiBy R1 but I
 - Improved thumbnail loading times with some caching and pre-generation changes
 - CoverFlow artwork now loads instantly and I added fade-in-out so it looks smoother when scrolling
 - Album grid view: adds a 4 column cover art grid
+- Waveform mode now shows the audio format
+- Tapping the artist name from Now Playing jumps to their album list / discography
 - Most played lists the number of plays for each track
 - Swiping from the cover to the lyrics fades the background (reflection). The way it just popped previously was annoying
 - Added iPod mode (access from lower right menu in now playing), just for fun
