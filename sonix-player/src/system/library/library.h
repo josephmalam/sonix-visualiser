@@ -301,6 +301,9 @@ int library_for_each_ordered(library_list_t kind, library_filter_t filter, const
 // False when the file is not in the index; `out` untouched then.
 bool library_track_title(const char *path, char *out, size_t out_size);
 
+// Whether the indexed tracks include this artist or album artist.
+bool library_artist_has_tracks(const char *name, library_filter_t filter);
+
 // Where each of `count` paths sits on its record, as the scan stored it: the
 // album, the disc (1 when the file has no disc tag) and the track number (0
 // when it has none). `cb` is called once for every path the index holds, with

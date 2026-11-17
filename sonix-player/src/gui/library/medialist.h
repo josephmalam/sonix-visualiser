@@ -107,6 +107,7 @@ bool medialist_step_back_to_player(void);
 // Opens one artist the way their disc button was last left: the records, or
 // the tracks strung out. What the search opens an artist with.
 void medialist_open_artist(const char *name);
+void medialist_open_artist_filtered(const char *name, library_filter_t filter);
 
 // Re-reads what is playing and moves the accent mark to whichever rows now
 // carry it. Called from the player whenever the track changes; cheap enough

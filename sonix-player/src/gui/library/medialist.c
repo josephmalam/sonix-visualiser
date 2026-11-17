@@ -3335,12 +3335,14 @@ static void album_order_clicked_cb(lv_event_t *e) {
 	open_replacing = false;
 }
 
-void medialist_open_artist(const char *name) {
+void medialist_open_artist_filtered(const char *name, library_filter_t filter) {
 	if (!name || !name[0]) {
 		return;
 	}
-	medialist_open(name, artist_records ? LIBRARY_LIST_ALBUMS : LIBRARY_LIST_TRACKS, LIBRARY_FILTER_ARTIST, name);
+	medialist_open(name, artist_records ? LIBRARY_LIST_ALBUMS : LIBRARY_LIST_TRACKS, filter, name);
 }
+
+void medialist_open_artist(const char *name) { medialist_open_artist_filtered(name, LIBRARY_FILTER_ARTIST); }
 
 // Copies the path of the one row a window was asked for.
 static bool take_one_path_cb(const char *name, const char *path, const char *artist, void *user) {

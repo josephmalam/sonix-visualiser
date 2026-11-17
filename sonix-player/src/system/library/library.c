@@ -1851,6 +1851,24 @@ static const char *filter_where(library_filter_t filter) {
 	}
 }
 
+bool library_artist_has_tracks(const char *name, library_filter_t filter) {
+	if (!name || !name[0] || (filter != LIBRARY_FILTER_ARTIST && filter != LIBRARY_FILTER_ALBUM_ARTIST)) {
+		return false;
+	}
+	pthread_mutex_lock(&db_lock);
+	char sql[256];
+	snprintf(sql, sizeof(sql), "SELECT 1 FROM MEDIA_TABLE WHERE %s LIMIT 1", filter_where(filter));
+	sqlite3_stmt *stmt = NULL;
+	bool found = false;
+	if (db && sqlite3_prepare_v2(db, sql, -1, &stmt, NULL) == SQLITE_OK) {
+		sqlite3_bind_text(stmt, 1, name, -1, SQLITE_TRANSIENT);
+		found = sqlite3_step(stmt) == SQLITE_ROW;
+	}
+	sqlite3_finalize(stmt);
+	pthread_mutex_unlock(&db_lock);
+	return found;
+}
+
 bool library_track_title(const char *path, char *out, size_t out_size) {
 	if (!path || !path[0] || !out) {
 		return false;

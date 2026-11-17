@@ -66,7 +66,7 @@ static lv_obj_t *play_btn;
 static lv_obj_t *play_btn_icon;
 static lv_obj_t *song_title_label;
 static lv_obj_t *song_artist_label;
-static lv_obj_t *format_label; // "16/44.1 FLAC", right of the artist line
+static lv_obj_t *format_label; // e.g. "16/44.1 FLAC", placed by the current layout
 static lv_obj_t *fav_btn_obj;  // the button it sits on, hidden on a book
 static lv_obj_t *controls_row; // transport row: where the ellipsis lives, and the star in Studio
 static lv_obj_t *fav_btn_icon; // the star above it
@@ -273,6 +273,8 @@ static int cover_box_w, cover_box_h;   // the artwork spans the full screen widt
 // this size a hairline is one pixel of a colour that is half background, and
 // the whole thing reads as noise.
 #define WAVE_HEIGHT 64
+#define WAVE_FORMAT_GAP 4
+#define WAVE_FORMAT_LIFT 14
 #define WAVE_BAR_GAP 3
 #define WAVE_MIN_BAR 3	  // a silent column is still a mark, not a hole
 #define WAVE_PAST_OPA 255 // the part already played
@@ -1263,7 +1265,7 @@ static void slider_over_waveform(bool over) {
 	if (over && wave_box) {
 		lv_obj_set_parent(progress_slider, wave_box);
 		lv_obj_set_size(progress_slider, lv_pct(100), WAVE_HEIGHT);
-		lv_obj_align(progress_slider, LV_ALIGN_CENTER, 0, 0);
+		lv_obj_align(progress_slider, LV_ALIGN_BOTTOM_MID, 0, 0);
 		lv_obj_set_style_bg_opa(progress_slider, LV_OPA_TRANSP, LV_PART_MAIN);
 		lv_obj_set_style_bg_opa(progress_slider, LV_OPA_TRANSP, LV_PART_INDICATOR);
 		lv_obj_set_style_opa(progress_slider, LV_OPA_TRANSP, LV_PART_KNOB);
@@ -2251,6 +2253,42 @@ static void lyrics_offer_download(void) {
 // a swipe the other way on the sleeve is the player being put away.
 static bool lyrics_swiped; // the release that ends a swipe is not a tap on a line
 
+static void artist_clicked_cb(lv_event_t *e) {
+	if (!sheet_open || player_sheet_drag_active() || lyrics_swiped) {
+		return;
+	}
+	const char *shown = lv_label_get_text(lv_event_get_target(e));
+	if (!shown[0]) {
+		return;
+	}
+	device_state_t state;
+	device_state_get(&state);
+	if (state.live || !state.current_file[0]) {
+		return;
+	}
+	if (!library_is_open()) {
+		gui_notify_no_card();
+		return;
+	}
+
+	const char *credited = metadata_shown_artist(&state.metadata);
+	library_filter_t preferred = credited == state.metadata.album_artist && strcmp(shown, credited) == 0
+									 ? LIBRARY_FILTER_ALBUM_ARTIST : LIBRARY_FILTER_ARTIST;
+	library_filter_t other = preferred == LIBRARY_FILTER_ARTIST ? LIBRARY_FILTER_ALBUM_ARTIST : LIBRARY_FILTER_ARTIST;
+	library_filter_t filter = library_artist_has_tracks(shown, preferred) ? preferred : other;
+	if (filter == other && !library_artist_has_tracks(shown, other)) {
+		gui_notify_popup("No tracks by this artist in the library.");
+		return;
+	}
+	char name[sizeof(state.metadata.artist)];
+	snprintf(name, sizeof(name), "%s", shown);
+	player_sheet_close(false);
+	medialist_open_artist_filtered(name, filter);
+	if (!medialist_step_back_to_player()) {
+		switcher_set_player_return(lv_screen_active());
+	}
+}
+
 static void lyrics_swiped_clear_cb(void *unused) {
 	(void)unused;
 	lyrics_swiped = false;
@@ -2446,6 +2484,8 @@ static void lyrics_build(void) {
 	lv_obj_set_style_text_font(lyrics_head_artist, lv_obj_get_style_text_font(song_artist_label, 0), 0);
 	lv_obj_set_style_text_color(lyrics_head_artist, lv_color_make(200, 200, 200), 0);
 	scrolltext_apply(lyrics_head_artist);
+	lv_obj_set_clickable(lyrics_head_artist, true);
+	lv_obj_add_event_cb(lyrics_head_artist, artist_clicked_cb, LV_EVENT_CLICKED, NULL);
 
 	lyrics_find_btn = lv_btn_create(player_screen);
 	lv_obj_set_ignore_layout(lyrics_find_btn, true);
@@ -2947,8 +2987,15 @@ static void apply_layout(void) {
 			lv_obj_set_parent(fav_btn_obj, alt_fav_circle);
 			lv_obj_center(fav_btn_obj);
 		}
-		if (format_label) {
-			lv_obj_set_hidden(format_label, true); // the sleeve is not the place for a bitrate
+		if (format_label && wave_canvas) {
+			lv_obj_set_parent(format_label, wave_box);
+			lv_obj_align(format_label, LV_ALIGN_TOP_MID, 0, 0);
+			lv_obj_set_style_translate_y(format_label, -WAVE_FORMAT_LIFT, 0);
+			lv_obj_set_style_text_align(format_label, LV_TEXT_ALIGN_CENTER, 0);
+			lv_obj_set_hidden(format_label, false);
+			lv_obj_set_height(wave_box, WAVE_HEIGHT + WAVE_FORMAT_GAP + lv_font_get_line_height(&font_ui_18));
+		} else if (format_label) {
+			lv_obj_set_hidden(format_label, true);
 		}
 		if (song_side_obj) {
 			lv_obj_set_hidden(song_side_obj, true);
@@ -2986,6 +3033,10 @@ static void apply_layout(void) {
 			lv_obj_move_to_index(fav_btn_obj, 0);
 		}
 		if (format_label) {
+			lv_obj_set_parent(format_label, song_side_obj);
+			lv_obj_set_align(format_label, LV_ALIGN_DEFAULT);
+			lv_obj_remove_local_style_prop(format_label, LV_STYLE_TRANSLATE_Y, 0);
+			lv_obj_set_style_text_align(format_label, LV_TEXT_ALIGN_RIGHT, 0);
 			lv_obj_set_hidden(format_label, false);
 		}
 		if (song_side_obj) {
@@ -5210,6 +5261,9 @@ void player_init(gui_config_t *cfg) {
 	lv_obj_add_style(song_artist_label, &theme_style_text_dim, 0);
 	lv_obj_set_style_text_font(song_artist_label, &font_ui_24, 0);
 	scrolltext_apply(song_artist_label);
+	lv_obj_set_clickable(song_artist_label, true);
+	lv_obj_set_event_bubble(song_artist_label, true);
+	lv_obj_add_event_cb(song_artist_label, artist_clicked_cb, LV_EVENT_CLICKED, NULL);
 
 	// Right side: the favourite star over the stream format.
 	lv_obj_t *song_side = lv_obj_create(song_info);
@@ -5249,6 +5303,10 @@ void player_init(gui_config_t *cfg) {
 	lv_obj_remove_style_all(wave_box);
 	lv_obj_set_size(wave_box, lv_pct(100), WAVE_HEIGHT);
 	lv_obj_set_scrollable(wave_box, false);
+	// Let the format sit above the waveform without moving its seeking area.
+	lv_obj_set_overflow_visible(wave_box, true);
+	lv_obj_set_ext_draw_size(wave_box, WAVE_FORMAT_LIFT);
+	lv_obj_refresh_ext_draw_size(wave_box);
 	lv_obj_set_hidden(wave_box, true);
 
 	{
@@ -5262,7 +5320,7 @@ void player_init(gui_config_t *cfg) {
 			wave_canvas = lv_canvas_create(wave_box);
 			lv_canvas_set_buffer(wave_canvas, wave_buf, wave_w, WAVE_HEIGHT, LV_COLOR_FORMAT_RGB565A8);
 			lv_obj_set_size(wave_canvas, wave_w, WAVE_HEIGHT);
-			lv_obj_align(wave_canvas, LV_ALIGN_CENTER, 0, 0);
+			lv_obj_align(wave_canvas, LV_ALIGN_BOTTOM_MID, 0, 0);
 			lv_obj_set_clickable(wave_canvas, false);
 		} else {
 			fprintf(stderr, "player: no room for the waveform; the alternative layout keeps the bar\n");
@@ -5556,6 +5614,7 @@ void player_init(gui_config_t *cfg) {
 	// on the title, so putting the player away by pushing it off the right of
 	// the screen worked everywhere except on the words naming the track.
 	lv_obj_set_clickable(alt_text_col, false);
+	lv_obj_set_event_bubble(alt_text_col, true);
 
 	for (int i = 0; i < 2; i++) {
 		lv_obj_t *pill = lv_obj_create(alt_text_col);
@@ -5571,6 +5630,7 @@ void player_init(gui_config_t *cfg) {
 		// surface of fixed weight, which separates from artwork on its own, and
 		// the shadow under it only made the pill look pasted on.
 		lv_obj_set_scrollable(pill, false);
+		lv_obj_set_event_bubble(pill, true);
 		lv_obj_set_clickable(pill, false);
 		if (i == 0) {
 			alt_title_pill = pill;
