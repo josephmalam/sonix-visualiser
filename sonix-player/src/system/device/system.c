@@ -668,7 +668,9 @@ bool storage_sd_writable(void) { return sd_writable; }
 static int mount_sd(storage_config_t *storage_cfg, const system_runtime_t *runtime) {
 	(void)runtime;
 
-	const char *mount_point = pick_sd_root(storage_cfg);
+	const char *mount_point = !storage_cfg->manage_mount && storage_cfg->mount_point
+								  ? storage_cfg->mount_point
+								  : pick_sd_root(storage_cfg);
 	snprintf(sd_root, sizeof(sd_root), "%s", mount_point);
 
 	if (!storage_cfg->manage_mount || getenv("SONIX_NO_MOUNT")) {
@@ -813,6 +815,7 @@ static void card_databases_detach(void) {
 	logging_suspend_for_usb(); // closes the on-card log file
 	btlog_card_release();
 	library_close();
+	cover_set_cache_dir(NULL);
 	audiobookdb_close();
 	printf("storage: card databases closed for removal\n");
 }
@@ -834,10 +837,6 @@ static void card_databases_attach(const char *root) {
 	library_open(path);
 	snprintf(path, sizeof(path), "%.*s/.local/audiobooks.db", room, root);
 	audiobookdb_open(path);
-
-	// The card may have been written somewhere else while it was out: looked
-	// over in the background, as soon as the index is open.
-	library_card_returned(root);
 
 	// Everything else that keeps a path on the card. These only cache a
 	// directory and open files on demand, but the directory is derived once, so
@@ -863,6 +862,8 @@ static void card_databases_attach(const char *root) {
 	logging_attach_sd(root);
 	btlog_card_attach(root);
 
+	// Detect changes and thumbnail warming need both databases on this card.
+	library_card_returned(root);
 	printf("storage: card databases reopened on %s\n", root);
 }
 
@@ -1044,7 +1045,6 @@ void storage_release_for_shutdown(void) {
 	}
 
 	card_databases_detach(); // playback, the log, the library and audiobook databases
-	cover_set_cache_dir(NULL); // the thumbnail cache moves to /tmp
 	radio_store_close();
 	sync();
 

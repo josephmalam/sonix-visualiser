@@ -162,7 +162,7 @@ static size_t decode_budget_bytes(void) {
 // cannot afford. That is how the stock player shows poster-sized covers on the
 // same 64 MB. Progressive JPEGs and PNGs fall back to stb_image under the
 // memory budget.
-static bool decode_raw(const uint8_t *data, size_t size, int max_box, raw_image_t *out) {
+static bool decode_raw(const uint8_t *data, size_t size, int max_box, bool quiet, raw_image_t *out) {
 	memset(out, 0, sizeof(*out));
 
 	if (!data || size == 0)
@@ -176,7 +176,9 @@ static bool decode_raw(const uint8_t *data, size_t size, int max_box, raw_image_
 			// happened: TJpgDec only ever halves, and a picture already smaller
 			// than the box comes out untouched, so one number alone would make a
 			// 360x360 cover look like something that had been reduced.
-			fprintf(stderr, "cover: decoded jpeg %dx%d -> %dx%d\n", src_w, src_h, w, h);
+			if (!quiet) {
+				fprintf(stderr, "cover: decoded jpeg %dx%d -> %dx%d\n", src_w, src_h, w, h);
+			}
 			out->pixels = pixels;
 			out->w = w;
 			out->h = h;
@@ -198,14 +200,16 @@ static bool decode_raw(const uint8_t *data, size_t size, int max_box, raw_image_
 		size_t peak = 0;
 		pixels = jpeg_planes_decode(data, size, max_box * 2, decode_budget_bytes(), &w, &h, &peak);
 		if (pixels) {
-			fprintf(stderr, "cover: decoded progressive jpeg to %dx%d (planes, peak about %zu KB)\n", w, h,
-					peak / 1024);
+			if (!quiet) {
+				fprintf(stderr, "cover: decoded progressive jpeg to %dx%d (planes, peak about %zu KB)\n", w, h,
+						peak / 1024);
+			}
 			out->pixels = pixels;
 			out->w = w;
 			out->h = h;
 			return true;
 		}
-		if (peak > 0) {
+		if (!quiet && peak > 0) {
 			fprintf(stderr, "cover: skipping jpeg artwork, decoding it would need about %zu KB (budget %zu KB)\n",
 					peak / 1024, decode_budget_bytes() / 1024);
 		}
@@ -221,7 +225,9 @@ static bool decode_raw(const uint8_t *data, size_t size, int max_box, raw_image_
 		int w = 0, h = 0;
 		uint8_t *pixels = png_scaled_decode(data, size, max_box * 2, &w, &h);
 		if (pixels) {
-			fprintf(stderr, "cover: decoded png to %dx%d (scaled)\n", w, h);
+			if (!quiet) {
+				fprintf(stderr, "cover: decoded png to %dx%d (scaled)\n", w, h);
+			}
 			out->pixels = pixels;
 			out->w = w;
 			out->h = h;
@@ -241,20 +247,26 @@ static bool decode_raw(const uint8_t *data, size_t size, int max_box, raw_image_
 	if (needed > budget) {
 		// Better no artwork than an allocation that wedges the whole player
 		// halfway down a folder.
-		fprintf(stderr, "cover: skipping %dx%d artwork, decoding it would need about %zu KB (budget %zu KB)\n", w, h,
-				needed / 1024, budget / 1024);
+		if (!quiet) {
+			fprintf(stderr, "cover: skipping %dx%d artwork, decoding it would need about %zu KB (budget %zu KB)\n", w, h,
+					needed / 1024, budget / 1024);
+		}
 		return false;
 	}
 
 	uint8_t *pixels = stbi_load_from_memory(data, (int)size, &w, &h, &comp, 3);
 	if (!pixels) {
-		fprintf(stderr, "cover: decode of %dx%d artwork failed\n", w, h);
+		if (!quiet) {
+			fprintf(stderr, "cover: decode of %dx%d artwork failed\n", w, h);
+		}
 		return false;
 	}
 
 	// One line per decode: this is the most expensive thing the browser does, and
 	// the log shows how many decodes a folder actually triggers.
-	fprintf(stderr, "cover: decoded %dx%d (%d bytes/px)\n", w, h, bpp);
+	if (!quiet) {
+		fprintf(stderr, "cover: decoded %dx%d (%d bytes/px)\n", w, h, bpp);
+	}
 
 	out->pixels = pixels;
 	out->w = w;
@@ -1266,6 +1278,7 @@ typedef struct {
 	// itself, so it has to be a blurred continuation of the part it covers --
 	// a mirrored centre crop would read as a different photograph.
 	bool from_bottom;
+	bool quiet; // a background batch reports its totals
 } image_request_t;
 
 // Decodes once and produces every requested image from that one decode. The
@@ -1295,7 +1308,7 @@ static bool build_images(const uint8_t *data, size_t size, const image_request_t
 	}
 
 	raw_image_t raw;
-	if (!decode_raw(data, size, max_box, &raw)) {
+	if (!decode_raw(data, size, max_box, reqs[0].quiet, &raw)) {
 		return false;
 	}
 
@@ -2049,6 +2062,39 @@ static uint64_t thumb_hash(const char *path, int box, bool is_dir) {
 	return h;
 }
 
+// Cover Flow keys include the selected sidecar so an in-place replacement,
+// addition or removal is caught even if the audio file did not change.
+// Existing picture keys are still used to migrate old thumbnails on demand.
+static bool album_thumb_key(const char *path, char *key, size_t size) {
+	char audio[512], sidecar[1300];
+	struct stat track, image;
+	if (!albumart_track_sources(path, audio, sizeof(audio), sidecar, sizeof(sidecar)) ||
+		stat(audio, &track) != 0 || (sidecar[0] && stat(sidecar, &image) != 0)) {
+		return false;
+	}
+
+	uint64_t hash = thumb_hash(path, COVER_ALBUM_THUMB_SIZE, false);
+	char sources[2000];
+	snprintf(sources, sizeof(sources), "|cf1|%s|%lld|%lld|%ld|%lld|%s|%lld|%lld|%ld|%lld",
+			 audio, (long long)track.st_size, (long long)track.st_mtime, track.st_mtim.tv_nsec,
+			 (long long)track.st_ctime, sidecar, sidecar[0] ? (long long)image.st_size : 0,
+			 sidecar[0] ? (long long)image.st_mtime : 0, sidecar[0] ? image.st_mtim.tv_nsec : 0L,
+			 sidecar[0] ? (long long)image.st_ctime : 0);
+	for (const char *p = sources; *p; p++) {
+		hash ^= (uint8_t)*p;
+		hash *= 1099511628211ULL;
+	}
+	snprintf(key, size, "%016llx", (unsigned long long)hash);
+	return true;
+}
+
+bool cover_cache_on_card(const char *root) {
+	pthread_mutex_lock(&thumb_db_lock);
+	bool available = thumb_db && root && strcmp(thumb_db_base, root) == 0;
+	pthread_mutex_unlock(&thumb_db_lock);
+	return available;
+}
+
 // Builds the cache key. False means this size is not worth caching. Whether the
 // database is open at all is decided under the lock, in load and store.
 static bool thumb_key(char *out, size_t out_size, const char *path, int box, bool is_dir) {
@@ -2101,7 +2147,9 @@ static bool thumb_db_load(const char *key, cover_image_t *out, bool *has_image) 
 	}
 
 	sqlite3_stmt *stmt = NULL;
-	if (sqlite3_prepare_v2(thumb_db, "SELECT w, h, pixels FROM thumbs WHERE key = ?1", -1, &stmt, NULL) == SQLITE_OK) {
+	const char *sql = out ? "SELECT w, h, pixels FROM thumbs WHERE key = ?1"
+						  : "SELECT w, h, length(pixels) FROM thumbs WHERE key = ?1";
+	if (sqlite3_prepare_v2(thumb_db, sql, -1, &stmt, NULL) == SQLITE_OK) {
 		sqlite3_bind_text(stmt, 1, key, -1, SQLITE_STATIC);
 		if (sqlite3_step(stmt) == SQLITE_ROW) {
 			int w = sqlite3_column_int(stmt, 0);
@@ -2112,7 +2160,9 @@ static bool thumb_db_load(const char *key, cover_image_t *out, bool *has_image) 
 					*has_image = false; // cached "no artwork here"
 					hit = true;
 				}
-			} else if (image_from_column(stmt, 2, w, h, out)) {
+			} else if (out ? image_from_column(stmt, 2, w, h, out)
+						   : w > 0 && h > 0 && w <= COVER_ALBUM_THUMB_SIZE && h <= COVER_ALBUM_THUMB_SIZE &&
+								 sqlite3_column_int(stmt, 2) == w * h * 2) {
 				*has_image = true;
 				hit = true;
 			}
@@ -2126,11 +2176,12 @@ static bool thumb_db_load(const char *key, cover_image_t *out, bool *has_image) 
 
 // A single write, made atomic by SQLite: no more .tmp file and rename, since
 // the database journal does the same job.
-static void thumb_db_store(const char *key, const cover_image_t *img, bool has_image) {
+static bool thumb_db_store(const char *key, const cover_image_t *img, bool has_image) {
+	bool stored = false;
 	pthread_mutex_lock(&thumb_db_lock);
 	if (!thumb_db) {
 		pthread_mutex_unlock(&thumb_db_lock);
-		return;
+		return false;
 	}
 
 	sqlite3_stmt *stmt = NULL;
@@ -2148,11 +2199,12 @@ static void thumb_db_store(const char *key, const cover_image_t *img, bool has_i
 			sqlite3_bind_int(stmt, 3, THUMB_NONE_EPOCH);
 			sqlite3_bind_null(stmt, 4);
 		}
-		sqlite3_step(stmt); // a failure here only costs a future re-decode
+		stored = sqlite3_step(stmt) == SQLITE_DONE;
 		sqlite3_finalize(stmt);
 	}
 
 	pthread_mutex_unlock(&thumb_db_lock);
+	return stored;
 }
 
 // ---------------------------------------------------------------------------
@@ -2248,8 +2300,8 @@ static void thumb_picture_store(void *ctx, const cover_image_t *outs) {
 // the same picture at the same size is taken instead. A picture key is only
 // written for the bytes an image was actually built from, so the answer is
 // the one the decode would have given.
-static cover_build_t thumb_build_track(const char *path, int size, cover_image_t *out) {
-	image_request_t req = {.w = size, .h = size, .fit = COVER_FIT_CONTAIN, .backdrop = false};
+static cover_build_t thumb_build_track(const char *path, int size, bool quiet, cover_image_t *out) {
+	image_request_t req = {.w = size, .h = size, .fit = COVER_FIT_CONTAIN, .quiet = quiet};
 	if (size > THUMB_DISK_MAX_SIZE) {
 		return build_from_sources(path, false, &req, 1, out);
 	}
@@ -2260,10 +2312,53 @@ static cover_build_t thumb_build_track(const char *path, int size, cover_image_t
 
 static cover_build_t thumb_load_uncached(const char *path, bool is_dir, int size, cover_image_t *out) {
 	if (!is_dir) {
-		return thumb_build_track(path, size, out);
+		return thumb_build_track(path, size, false, out);
 	}
 	image_request_t req = {.w = size, .h = size, .fit = COVER_FIT_CONTAIN, .backdrop = false};
 	return build_from_sources(path, is_dir, &req, 1, out);
+}
+
+cover_thumb_result_t cover_album_thumb(const char *path, cover_image_t *out) {
+	cover_image_t scratch = {0};
+	cover_image_t *image = out ? out : &scratch;
+	memset(image, 0, sizeof(*image));
+
+	char key[32];
+	bool keyed = album_thumb_key(path, key, sizeof(key));
+	if (!keyed && !out) {
+		return COVER_THUMB_ERROR;
+	}
+	bool has_image = false;
+	if (keyed && thumb_db_load(key, out, &has_image)) {
+		return COVER_THUMB_HIT;
+	}
+
+	cover_build_t built = thumb_build_track(path, COVER_ALBUM_THUMB_SIZE, out == NULL, image);
+	// A file may change while it is being read. Keep the usable result for a
+	// visible request but only write its path key if the sources still match.
+	char current[sizeof(key)];
+	bool stored = built != COVER_BUILD_FAILED && keyed && album_thumb_key(path, current, sizeof(current)) &&
+				  strcmp(key, current) == 0 && thumb_db_store(key, image, built == COVER_BUILD_OK);
+	cover_free(&scratch);
+	if (!stored) {
+		return COVER_THUMB_ERROR;
+	}
+	return built == COVER_BUILD_OK ? COVER_THUMB_GENERATED : COVER_THUMB_NO_ART;
+}
+
+bool cover_album_tile(const char *path, int size, cover_image_t *out) {
+	memset(out, 0, sizeof(*out));
+	cover_image_t album;
+	cover_album_thumb(path, &album);
+	if (!album.pixels) {
+		return false;
+	}
+
+	raw_image_t raw;
+	bool ok = raw_from_cover(&album, &raw) && make_scaled(&raw, size, size, COVER_FIT_COVER, out);
+	raw_free(&raw);
+	cover_free(&album);
+	return ok;
 }
 
 bool cover_thumb_cached(const char *path, int size, cover_image_t *out) {

@@ -60,6 +60,9 @@ bool albumart_load_for_dir(const char *dirpath, albumart_t *out);
 bool albumart_load_candidate(const char *filepath, int index, albumart_t *out);
 bool albumart_load_dir_candidate(const char *dirpath, int index, albumart_t *out);
 
+// Resolves the track and its selected external artwork without opening either.
+bool albumart_track_sources(const char *path, char *audio, size_t audio_size, char *sidecar, size_t sidecar_size);
+
 // True when the card went away while a mapped picture was being read: the
 // bytes read since are zeros, and anything made from them is to be thrown
 // away. Asked after the picture has been used, before albumart_free().

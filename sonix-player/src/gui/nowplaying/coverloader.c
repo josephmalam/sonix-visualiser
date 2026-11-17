@@ -88,9 +88,13 @@ static pthread_cond_t id_wakeup = PTHREAD_COND_INITIALIZER;
 // itself, first of all its jobs.
 static bool id_on_worker;
 static bool started;
+static int priority_slot = -1;
 
 // Picks up the next slot waiting to be decoded. Called with the lock held.
 static int next_pending(void) {
+	if (priority_slot >= 0 && slots[priority_slot].pending && !slots[priority_slot].running) {
+		return priority_slot;
+	}
 	for (int i = 0; i < COVERLOADER_SLOTS; i++) {
 		if (slots[i].pending && !slots[i].running) {
 			return i;
@@ -252,8 +256,17 @@ static void *worker(void *arg) {
 		pthread_mutex_unlock(&lock);
 
 		cover_image_t image;
-		bool found = share_w > 0 ? cover_load_shared(path, share_w, share_h, size, &image)
-								  : cover_thumb_load(path, false, size, &image);
+		bool found;
+		if (index >= COVERLOADER_COVERFLOW_BASE && index < COVERLOADER_COVERFLOW_BASE + COVERLOADER_COVERFLOW_COUNT) {
+			cover_album_thumb(path, &image);
+			found = image.pixels != NULL;
+		} else if (index >= COVERLOADER_ALBUM_GRID_BASE) {
+			found = cover_album_tile(path, size, &image);
+		} else if (share_w > 0) {
+			found = cover_load_shared(path, share_w, share_h, size, &image);
+		} else {
+			found = cover_thumb_load(path, false, size, &image);
+		}
 
 		pthread_mutex_lock(&lock);
 		slot->running = false;
@@ -362,6 +375,16 @@ void coverloader_request(int slot_index, const char *path, int size) {
 	slot->pending = true;
 
 	pthread_cond_signal(&wakeup);
+	pthread_mutex_unlock(&lock);
+}
+
+void coverloader_prioritize(int slot_index) {
+	if (slot_index < COVERLOADER_COVERFLOW_BASE ||
+		slot_index >= COVERLOADER_COVERFLOW_BASE + COVERLOADER_COVERFLOW_COUNT) {
+		return;
+	}
+	pthread_mutex_lock(&lock);
+	priority_slot = slot_index;
 	pthread_mutex_unlock(&lock);
 }
 

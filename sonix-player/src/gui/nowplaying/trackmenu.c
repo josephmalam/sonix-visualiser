@@ -11,6 +11,8 @@
 #include "src/gui/shell/icons.h"
 #include "src/gui/library/medialist.h"
 #include "src/gui/nowplaying/player.h"
+#include "src/gui/nowplaying/visualiser.h"
+#include "src/gui/nowplaying/ipodmode.h"
 #include "src/gui/library/playlistpage.h"
 #include "src/gui/streaming/qobuzpage.h"
 #include "src/gui/streaming/tidalpage.h"
@@ -1819,6 +1821,16 @@ void trackmenu_details_open(const char *path) {
 	switcher_set_player_return(NULL);
 }
 
+static void open_visualiser_cb(void *user) {
+	(void)user;
+	visualiser_open(g_cfg);
+}
+
+static void open_ipod_mode_cb(void *user) {
+	(void)user;
+	ipod_mode_open(g_cfg);
+}
+
 void trackmenu_open(lv_obj_t *anchor) {
 	// Two tables rather than one with the label patched at runtime, because of
 	// the string-extraction tool: it reads popover_item_t initialisers (see
@@ -1832,6 +1844,8 @@ void trackmenu_open(lv_obj_t *anchor) {
 	// borrowed term to make a menu line up.
 	static const popover_item_t ITEMS[] = {
 		{"trackmenu_queue", open_queue_cb, NULL},
+		{"trackmenu_visualiser", open_visualiser_cb, NULL},
+		{"iPod mode", open_ipod_mode_cb, NULL},
 		{"add_to_playlist", add_to_playlist_cb, NULL},
 		{"show_album", open_album_cb, NULL},
 		{"details", open_details_cb, NULL},
@@ -1849,7 +1863,11 @@ void trackmenu_open(lv_obj_t *anchor) {
 	device_state_get(&state);
 	bool podcast = state.current_file[0] && podcastcache_is_episode(state.current_file);
 
-	popover_show(anchor, podcast ? ITEMS_PODCAST : ITEMS, 5);
+		if (podcast) {
+		popover_show(anchor, ITEMS_PODCAST, (int)(sizeof(ITEMS_PODCAST) / sizeof(ITEMS_PODCAST[0])));
+	} else {
+		popover_show(anchor, ITEMS, (int)(sizeof(ITEMS) / sizeof(ITEMS[0])));
+	}
 }
 
 void trackmenu_init(gui_config_t *cfg) {

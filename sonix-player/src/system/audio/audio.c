@@ -1,4 +1,5 @@
 #include "audio.h"
+#include "visualiser_audio.h"
 #include "src/system/audio/alsa-controls.h"
 #include "src/system/bluetooth/bluetooth.h"
 #include "src/system/decode/decode.h"
@@ -2306,6 +2307,7 @@ static void playback_wrote(snd_pcm_t *pcm, snd_pcm_uframes_t frames) {
 static int playback_wake_fd = -1;
 
 static void playback_wake(void) {
+	visualiser_audio_reset();
 	uint64_t one = 1;
 	if (playback_wake_fd >= 0 && write(playback_wake_fd, &one, sizeof(one)) < 0) {
 		// Full counter: a wake-up is already pending, which is all this asks.
@@ -2347,6 +2349,29 @@ static int pcm_wait_or_wake(snd_pcm_t *pcm, int timeout_ms) {
 		return -EIO;
 	}
 	return (revents & POLLOUT) ? 1 : 0;
+}
+
+// Estimate the presentation time only while the visualiser is collecting
+// samples. Some devices write in bursts, so limit the delay queries.
+static void visualiser_after_write(snd_pcm_t *pcm, const void *buffer, snd_pcm_sframes_t written,
+								  int channels, int rate, int bits, unsigned epoch) {
+	if (!epoch || written <= 0 || !visualiser_audio_can_capture(epoch) || !pcm_playing(pcm)) {
+		return;
+	}
+	static unsigned last_epoch;
+	static uint32_t last_ms;
+	uint32_t now = visualiser_audio_now_ms();
+	if (epoch == last_epoch && now - last_ms < 23) {
+		return;
+	}
+	last_epoch = epoch;
+	last_ms = now;
+
+	snd_pcm_sframes_t queued = 0;
+	if (snd_pcm_delay(pcm, &queued) < 0) {
+		queued = 0;
+	}
+	visualiser_audio_capture(buffer, (size_t)written, channels, rate, bits, epoch, now, queued);
 }
 
 static snd_pcm_sframes_t pcm_write_recover(snd_pcm_t **pcm, const void *buf, snd_pcm_uframes_t frames, int channels,
@@ -2405,6 +2430,7 @@ static snd_pcm_sframes_t pcm_write_recover(snd_pcm_t **pcm, const void *buf, snd
 		}
 
 		write_recoveries++;
+		visualiser_audio_reset();
 		fprintf(stderr, "audio[%ld]: write error: %s (recovery %d)\n", log_ms(), snd_strerror((int)written),
 				attempt + 1);
 
@@ -3056,6 +3082,7 @@ static void play_wav_file(const char *filepath) {
 		}
 
 		health_lap(&health, STAGE_EFFECTS);
+		unsigned visual_epoch = visualiser_audio_epoch();
 		snd_pcm_sframes_t written = pcm_write_recover(&pcm_handle, buffer, frames_to_write, info.channels,
 													  info.sample_rate, info.out_bits, &period_size);
 		health_lap(&health, STAGE_WRITE);
@@ -3075,6 +3102,7 @@ static void play_wav_file(const char *filepath) {
 			break;
 		}
 
+		visualiser_after_write(pcm_handle, buffer, written, info.channels, info.sample_rate, info.out_bits, visual_epoch);
 		bt_seek_probe_report(pcm_handle);
 		bt_start_probe_note(pcm_handle, written, info.sample_rate);
 
@@ -3828,6 +3856,7 @@ static void play_decoded_file(const char *filepath, decode_format_t format) {
 		}
 
 		health_lap(&health, STAGE_EFFECTS);
+		unsigned visual_epoch = passthrough ? 0 : visualiser_audio_epoch();
 		snd_pcm_sframes_t written =
 			pcm_write_recover(&pcm_handle, buffer, frames_read, channels, out_rate, out_bits, &period_size);
 		health_lap(&health, STAGE_WRITE);
@@ -3851,6 +3880,7 @@ static void play_decoded_file(const char *filepath, decode_format_t format) {
 			break;
 		}
 
+		visualiser_after_write(pcm_handle, buffer, written, channels, out_rate, out_bits, visual_epoch);
 		bt_seek_probe_report(pcm_handle);
 		bt_start_probe_note(pcm_handle, written, out_rate);
 
@@ -4124,6 +4154,7 @@ int audio_play(const char *filepath) {
 	// The playback thread routes at track start, the stock engine's way.
 
 	pthread_mutex_lock(&audio_mutex);
+	visualiser_audio_reset();
 	restart_fresh_pending = false; // an explicit play beats the armed restart
 	strncpy(current_filepath, filepath, sizeof(current_filepath) - 1);
 	play_request = true;
@@ -4165,6 +4196,7 @@ int audio_play_at(const char *filepath, double start_secs) {
 	fprintf(stderr, "audio[%ld]: play requested '%s' from %.1f s\n", log_ms(), filepath, start_secs);
 
 	pthread_mutex_lock(&audio_mutex);
+	visualiser_audio_reset();
 	restart_fresh_pending = false; // an explicit play beats the armed restart
 	strncpy(current_filepath, filepath, sizeof(current_filepath) - 1);
 	current_filepath[sizeof(current_filepath) - 1] = '\0';
@@ -4190,6 +4222,7 @@ int audio_play_paused(const char *filepath, double start_secs) {
 	fprintf(stderr, "audio[%ld]: restore requested '%s' at %.1f s (paused)\n", log_ms(), filepath, start_secs);
 
 	pthread_mutex_lock(&audio_mutex);
+	visualiser_audio_reset();
 	restart_fresh_pending = false; // an explicit play beats the armed restart
 	strncpy(current_filepath, filepath, sizeof(current_filepath) - 1);
 	current_filepath[sizeof(current_filepath) - 1] = '\0';
@@ -4539,6 +4572,7 @@ void audio_set_output_device(const char *pcm) {
 	pthread_mutex_unlock(&output_lock);
 
 	if (strcmp(before, after) != 0) {
+		visualiser_audio_reset();
 		fprintf(stderr, "audio[%ld]: the output moves from '%s' to '%s'\n", log_ms(), before, after);
 	}
 }

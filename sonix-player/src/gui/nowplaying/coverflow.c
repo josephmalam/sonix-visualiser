@@ -58,10 +58,10 @@
 // walked through the positions in between, so one extra place is carried: at
 // any moment one of the six is off an edge.
 #define CF_BEFORE 2
-#define CF_SLOTS 6
+#define CF_SLOTS COVERLOADER_COVERFLOW_COUNT
 
 // The record: the size a square is decoded, built and drawn at.
-#define CF_MID_W 210
+#define CF_MID_W COVER_ALBUM_THUMB_SIZE
 
 // The height a fully turned record comes out at, and how wide its far edge is
 // as a percentage of its near one. Together they are the angle.
@@ -174,6 +174,7 @@ typedef struct {
 	bool requested;
 	bool settled; // the worker has answered, one way or the other
 	bool has_cover;
+	lv_opa_t opacity; // last opacity applied to this slot's image
 	uint32_t tone; // the sleeve's dominant colour, for the glow under the middle
 } cf_slot_t;
 
@@ -237,9 +238,13 @@ static int window_count;
 static void relayout(void);
 static void sheet_park(void);
 
-// At most one read from the thumbnail database per pass over the places: see
-// the note in slot_bind().
-static bool shortcut_taken;
+static int layout_base = INT32_MIN;
+static int priority_id = -1;
+static bool log_timing;
+static uint32_t request_started[CF_SLOTS];
+static unsigned timing_count;
+static uint64_t timing_total;
+static uint32_t timing_max;
 
 // ---------------------------------------------------------------------------
 // the setting
@@ -610,7 +615,11 @@ static const cf_row_t *album_at(int index) {
 // the places
 // ---------------------------------------------------------------------------
 
-static int slot_id(int i) { return COVERLOADER_COVERFLOW_BASE + i; }
+// An album keeps the same loader slot as it moves around the visible window.
+static int slot_id(int i) {
+	int base = layout_base == INT32_MIN ? 0 : layout_base;
+	return COVERLOADER_COVERFLOW_BASE + (base % CF_SLOTS + i) % CF_SLOTS;
+}
 
 // Where the middle of a place sits, as an offset down the column. `d` is 16.16
 // places and may be anything in between.
@@ -630,6 +639,20 @@ static int place_height(int32_t d) {
 		away = CF_ONE;
 	}
 	return CF_MID_W - (int)(((int64_t)away * (CF_MID_W - CF_LEAN_H)) >> 16);
+}
+
+// The outermost record fades over one place before its slot is recycled.
+// Smoothstep keeps the opacity continuous at both ends as the drag reverses.
+static lv_opa_t place_opacity(int32_t d) {
+	int32_t away = d < 0 ? -d : d;
+	if (away <= 2 * CF_ONE) {
+		return LV_OPA_COVER;
+	}
+	if (away >= 3 * CF_ONE) {
+		return LV_OPA_TRANSP;
+	}
+	int t = (3 * CF_ONE - away) >> 8;
+	return (lv_opa_t)((t * t * (768 - 2 * t) * 255u + (1u << 23)) >> 24);
 }
 
 // The tallest a place can ever be drawn. Only the two either side of the middle
@@ -673,7 +696,7 @@ static void slot_bind(int i) {
 	cf_slot_t *slot = &slots[i];
 	int base = scroll >> 16;
 	int index = base + i - CF_BEFORE;
-	int32_t d = ((int32_t)(i - CF_BEFORE) << 16) - (scroll - (base << 16));
+	int32_t d = (i - CF_BEFORE) * CF_ONE - (scroll - (base << 16));
 
 	const cf_row_t *album = album_at(index);
 	if (!album) {
@@ -688,7 +711,12 @@ static void slot_bind(int i) {
 		lv_obj_set_hidden(slot->image, true);
 		return;
 	}
-	lv_obj_set_hidden(slot->image, false);
+	lv_opa_t opacity = place_opacity(d);
+	if (slot->opacity != opacity) {
+		slot->opacity = opacity;
+		lv_obj_set_style_image_opa(slot->image, opacity, 0);
+	}
+	lv_obj_set_hidden(slot->image, opacity == LV_OPA_TRANSP);
 
 	if (slot->index != index) {
 		if (slot->requested) {
@@ -705,35 +733,18 @@ static void slot_bind(int i) {
 		face_reset(slot);
 	}
 
-	// The record arriving at the middle is the one being looked at, and if its
-	// sleeve is already on the card there is no reason for it to queue behind a
-	// worker for it: cover_thumb_cached() never decodes, so a hit is one small
-	// read and the picture is there in this frame.
-	//
-	// One per pass, and only for the two places either side of the middle. The
-	// rest go to the worker, which is what keeps a fast flick from turning into
-	// six reads on the interface thread.
-	if (!slot->settled && !shortcut_taken && album->has_path && (i == CF_BEFORE || i == CF_BEFORE + 1)) {
-		cover_image_t cached;
-		if (cover_thumb_cached(album->path, CF_MID_W, &cached)) {
-			face_paint(slot, &cached);
-			cover_free(&cached);
-			slot->settled = true;
-			shortcut_taken = true;
-			if (slot->requested) {
-				coverloader_release(slot_id(i));
-				slot->requested = false;
-			}
-		}
-	}
-
 	// Everything else is asked for straight away, moving or not. Holding the
 	// requests back while the column moved is what emptied the crate during a
 	// scroll.
 	if (!slot->requested && !slot->settled) {
 		if (album->has_path) {
-			coverloader_request(slot_id(i), album->path, CF_MID_W);
+			int id = slot_id(i);
+			if (log_timing) {
+				request_started[id - COVERLOADER_COVERFLOW_BASE] = lv_tick_get();
+			}
+			coverloader_request(id, album->path, CF_MID_W);
 			slot->requested = true;
+			lv_timer_resume(poll_timer);
 		} else {
 			slot->settled = true;
 		}
@@ -777,55 +788,31 @@ static void slot_bind(int i) {
 // once per frame.
 // ---------------------------------------------------------------------------
 
-static int layout_base = INT32_MIN;
-
 static void faces_rotate(int delta) {
-	uint8_t *face[CF_SLOTS];
-	bool has[CF_SLOTS];
-	uint32_t tone[CF_SLOTS];
-	int index[CF_SLOTS];
-	bool settled[CF_SLOTS];
-
-	for (int i = 0; i < CF_SLOTS; i++) {
-		// Anything in flight is addressed by the slot that asked for it, and
-		// that slot is about to be showing a different record. Let them all go;
-		// slot_bind asks again for whatever is still missing.
-		if (slots[i].requested) {
-			coverloader_release(slot_id(i));
-			slots[i].requested = false;
-		}
-		face[i] = slots[i].face;
-		has[i] = slots[i].has_cover;
-		tone[i] = slots[i].tone;
-		index[i] = slots[i].index;
-		settled[i] = slots[i].settled;
-	}
-
-	// The buffers nobody inherits, handed out to the places that came up empty.
-	uint8_t *spare[CF_SLOTS];
-	int spares = 0;
+	cf_slot_t old[CF_SLOTS];
+	memcpy(old, slots, sizeof(old));
 	for (int i = 0; i < CF_SLOTS; i++) {
 		int to = i - delta;
-		if (to < 0 || to >= CF_SLOTS) {
-			spare[spares++] = face[i];
+		if ((to < 0 || to >= CF_SLOTS) && old[i].requested) {
+			coverloader_release(slot_id(i));
 		}
 	}
 
-	int next_spare = 0;
 	for (int i = 0; i < CF_SLOTS; i++) {
-		int from = i + delta;
-		if (from >= 0 && from < CF_SLOTS) {
-			slots[i].face = face[from];
-			slots[i].has_cover = has[from];
-			slots[i].tone = tone[from];
-			slots[i].index = index[from];
-			slots[i].settled = settled[from];
+		int from = (i + delta + CF_SLOTS) % CF_SLOTS;
+		cf_slot_t *slot = &slots[i];
+		slot->face = old[from].face;
+		if (from == i + delta) {
+			slot->has_cover = old[from].has_cover;
+			slot->tone = old[from].tone;
+			slot->index = old[from].index;
+			slot->settled = old[from].settled;
+			slot->requested = old[from].requested;
 		} else {
-			slots[i].face = spare[next_spare++];
-			slots[i].has_cover = false;
-			slots[i].index = -1;
-			slots[i].settled = false;
-			face_reset(&slots[i]);
+			slot->index = -1;
+			slot->settled = false;
+			slot->requested = false;
+			face_reset(slot);
 		}
 		// The face this place is holding is not the one its turned copy was made
 		// from, whichever way it got here.
@@ -977,7 +964,6 @@ static void place_glow(void) {
 }
 
 static void relayout(void) {
-	shortcut_taken = false;
 	glow_best = INT32_MAX;
 	int base = scroll >> 16;
 	if (layout_base != INT32_MIN && base != layout_base && slots[0].face) {
@@ -998,8 +984,17 @@ static void relayout(void) {
 	}
 	layout_base = base;
 
+	int closest = CF_BEFORE + (scroll - (base << 16) > CF_ONE / 2);
+	int id = slot_id(closest);
+	if (id != priority_id) {
+		coverloader_prioritize(id);
+		priority_id = id;
+	}
+	slot_bind(closest);
 	for (int i = 0; i < CF_SLOTS; i++) {
-		slot_bind(i);
+		if (i != closest) {
+			slot_bind(i);
+		}
 	}
 	place_glow();
 }
@@ -1073,18 +1068,24 @@ static void poll_cb(lv_timer_t *timer) {
 		}
 		cover_image_t image;
 		bool finished = false;
-		if (coverloader_take(slot_id(i), &image, &finished)) {
-			// The struct was copied, so the descriptor has to be pointed at this
-			// copy's own buffer.
-			image.dsc.data = image.pixels;
-			// Printed onto the record, and then let go: a second copy of the
-			// sleeve beside the face would be a hundred kilobytes nothing reads.
+		int id = slot_id(i);
+		if (coverloader_take(id, &image, &finished)) {
+			// Print the sleeve onto the record, then release its pixel buffer.
 			face_paint(slot, &image);
 			cover_free(&image);
-			slot->settled = true;
+			if (log_timing) {
+				uint32_t elapsed = lv_tick_elaps(request_started[id - COVERLOADER_COVERFLOW_BASE]);
+				timing_total += elapsed;
+				timing_count++;
+				if (elapsed > timing_max) {
+					timing_max = elapsed;
+				}
+			}
 			changed = true;
-		} else if (finished) {
-			slot->settled = true; // no artwork: the blank record stays
+		}
+		if (finished) {
+			slot->requested = false;
+			slot->settled = true;
 		} else {
 			waiting = true;
 		}
@@ -1384,6 +1385,13 @@ static size_t face_bytes(void) { return (size_t)CF_MID_W * CF_MID_W * 2; }
 static size_t warp_bytes(const cf_slot_t *slot) { return (size_t)CF_MID_W * slot->warp_max_h * 3; }
 
 static void buffers_free(void) {
+	if (timing_count) {
+		printf("coverflow: %u covers displayed, %u ms average, %u ms max\n",
+			   timing_count, (unsigned)(timing_total / timing_count), timing_max);
+		timing_count = 0;
+		timing_total = 0;
+		timing_max = 0;
+	}
 	for (int i = 0; i < CF_SLOTS; i++) {
 		cf_slot_t *slot = &slots[i];
 		if (slot->requested) {
@@ -1946,6 +1954,7 @@ static void refresh_theme(void) {
 }
 
 void coverflow_init(gui_config_t *cfg) {
+	log_timing = getenv("SONIX_COVERFLOW_TIMING") != NULL;
 	sheet_h = cfg->screen_height;
 
 	sheet = lv_obj_create(lv_layer_top());
@@ -2021,6 +2030,8 @@ void coverflow_init(gui_config_t *cfg) {
 		slot->index = -1;
 		slot->warp_h = -1;
 		slot->image = lv_image_create(viewport);
+		slot->opacity = LV_OPA_COVER;
+		lv_obj_set_style_image_opa(slot->image, slot->opacity, 0);
 		lv_obj_set_event_bubble(slot->image, true);
 		lv_obj_set_hidden(slot->image, true);
 	}
@@ -2139,7 +2150,7 @@ void coverflow_init(gui_config_t *cfg) {
 	// edge stays blank AFTER its cover has already been read. It pauses itself
 	// the moment nothing is outstanding, so a crate standing still costs
 	// nothing at all.
-	poll_timer = lv_timer_create(poll_cb, 33, NULL);
+	poll_timer = lv_timer_create(poll_cb, 16, NULL);
 	lv_timer_pause(poll_timer);
 
 	refresh_theme();

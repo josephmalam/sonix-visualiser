@@ -203,13 +203,31 @@ void cover_set_backdrop_upright(bool upright);
 // thumbnail is kept on the card (see cover_set_cache_dir): a row coming back
 // into view is a few-kilobyte read, not a decode.
 //
-// For a track, the folder's artwork is looked up first -- every file in an
-// album resolves to the same picture, so they all share one cache entry.
+// Each track can supply its own artwork. Tracks with identical pictures share
+// the decoded thumbnail through the picture cache.
 // ---------------------------------------------------------------------------
 
 // Loads a square thumbnail. The caller owns `out` and must cover_free() it.
 // Returns false when there is no artwork for this path.
 bool cover_thumb_load(const char *path, bool is_dir, int size, cover_image_t *out);
+
+// Cover Flow and its pre-generation pass share the same thumbnail size and key.
+#define COVER_ALBUM_THUMB_SIZE 210
+
+typedef enum {
+	COVER_THUMB_HIT,
+	COVER_THUMB_GENERATED,
+	COVER_THUMB_NO_ART,
+	COVER_THUMB_ERROR,
+} cover_thumb_result_t;
+
+// With out == NULL, warm the disk cache without copying pixels on a hit.
+// With out set, the caller owns any pixels returned, even if caching failed.
+cover_thumb_result_t cover_album_thumb(const char *path, cover_image_t *out);
+bool cover_cache_on_card(const char *root);
+
+// Make a square grid tile from the album thumbnail cache, on a worker.
+bool cover_album_tile(const char *path, int size, cover_image_t *out);
 
 // Like cover_thumb_load, but only looks in the on-disk thumbnail cache --
 // never decodes. For pages that want covers instantly or not at all: the queue

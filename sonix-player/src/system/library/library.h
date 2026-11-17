@@ -554,6 +554,13 @@ bool library_index_buckets(const library_index_t *ix, int counts[LIBRARY_INDEX_B
 // with a `path` (a track to take the cover from) and an `artist` (the album's).
 int library_index_window(const library_index_t *ix, int offset, int count, library_row_cb cb, void *user);
 
+// Like library_index_window(), with the stored count for Most Played rows.
+// Other lists and missing rows report zero plays.
+typedef bool (*library_play_count_row_cb)(const char *name, const char *path, const char *artist,
+										  long long plays, void *user);
+int library_index_window_with_plays(const library_index_t *ix, int offset, int count,
+									library_play_count_row_cb cb, void *user);
+
 // A second handle over the same rows, without asking the database for the
 // sort again: the row ids are simply copied. What the playback queue is given
 // when a list is started, so the queue does not have to be a second copy of the

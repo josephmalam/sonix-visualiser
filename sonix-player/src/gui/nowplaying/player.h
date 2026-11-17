@@ -93,9 +93,9 @@ void player_key_play_pause(void);
 void player_key_next(void);
 void player_key_prev(void);
 
-// What the player's on-screen prev/next buttons do: seconds-sized skips on an
-// audiobook or podcast, previous/next track otherwise. The control centre
-// calls these so that it behaves exactly like the player.
+// The player's on-screen transport. Prev/next jump by seconds on a book or
+// podcast, and change tracks otherwise.
+void player_screen_play_pause(void);
 void player_screen_prev(void);
 void player_screen_next(void);
 

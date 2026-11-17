@@ -24,6 +24,7 @@
 
 #include "lvgl/lvgl.h"
 
+#include "src/gui/nowplaying/cover.h"
 #include "src/gui/library/browser.h"
 #include "src/gui/shell/gui.h"
 #include "src/system/audio/audio.h"
@@ -706,6 +707,7 @@ static void storage_export(void) {
 	device_state_note_storage_gone();
 	audio_stop();
 	library_close();
+	cover_set_cache_dir(NULL);
 	audiobookdb_close();
 	logging_suspend_for_usb();
 	btlog_card_release();
@@ -855,7 +857,10 @@ static void storage_restore(void) {
 	storage_active = false;
 
 	// What the computer changed is looked for now, in the background.
-	library_card_returned(sd_mount);
+	if (mount_still_up()) {
+		cover_set_cache_dir(sd_mount);
+		library_card_returned(sd_mount);
+	}
 	if (!suppress_popups) {
 		gui_post(popup_disconnected_cb, NULL);
 	}

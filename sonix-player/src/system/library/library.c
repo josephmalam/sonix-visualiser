@@ -1,5 +1,7 @@
 #include "library.h"
 
+#include "src/gui/nowplaying/cover.h"
+#include "src/system/audio/audio.h"
 #include "src/system/library/audiobookdb.h"
 #include "src/system/playback/playlist.h"
 #include "src/system/streaming/podcastdl.h"
@@ -1402,6 +1404,136 @@ static bool db_open_file(const char *db_path) {
 	return true;
 }
 
+// The warmer owns one thumbnail at a time. Read album paths in small
+// windows, so image I/O and decoding never hold the library lock.
+#define ALBUM_WARM_BATCH 8
+static pthread_mutex_t album_warm_lock = PTHREAD_MUTEX_INITIALIZER;
+static pthread_cond_t album_warm_done = PTHREAD_COND_INITIALIZER;
+static bool album_warm_enabled;
+static bool album_warm_running;
+static bool album_warm_pending;
+static unsigned album_warm_generation;
+static char album_warm_root[512];
+static bool album_warm_after_reorganize; // set by scan_launch before starting the scan thread
+
+static int album_warm_paths(sqlite3_int64 *after, char paths[][512]) {
+	int count = 0;
+	pthread_mutex_lock(&db_lock);
+	sqlite3_stmt *stmt = NULL;
+	const char *sql = "SELECT g.rowid, " ALBUM_GROUP_FIRST("m.path")
+					  " FROM ALBUM_GROUP_TABLE g WHERE g.rowid > ? ORDER BY g.rowid LIMIT ?";
+	if (db && sqlite3_prepare_v2(db, sql, -1, &stmt, NULL) == SQLITE_OK) {
+		sqlite3_bind_int64(stmt, 1, *after);
+		sqlite3_bind_int(stmt, 2, ALBUM_WARM_BATCH);
+		while (count < ALBUM_WARM_BATCH && sqlite3_step(stmt) == SQLITE_ROW) {
+			*after = sqlite3_column_int64(stmt, 0);
+			const char *path = (const char *)sqlite3_column_text(stmt, 1);
+			if (!path || snprintf(paths[count], sizeof(paths[count]), "%s", path) >= (int)sizeof(paths[count])) {
+				paths[count][0] = '\0';
+			}
+			count++;
+		}
+	}
+	sqlite3_finalize(stmt);
+	pthread_mutex_unlock(&db_lock);
+	return count;
+}
+
+static bool album_warm_current(unsigned generation) {
+	pthread_mutex_lock(&album_warm_lock);
+	bool current = album_warm_generation == generation;
+	pthread_mutex_unlock(&album_warm_lock);
+	return current;
+}
+
+// The output driver can need the card and memory while starting a track.
+static bool album_warm_wait_for_audio(unsigned generation) {
+	while (album_warm_current(generation)) {
+		if (audio_quiet_ms() >= 0) {
+			return true;
+		}
+		usleep(20 * 1000);
+	}
+	return false;
+}
+
+static void *album_warm_worker(void *arg) {
+	(void)arg;
+	thread_be_background(NULL);
+
+	pthread_mutex_lock(&album_warm_lock);
+	while (album_warm_pending) {
+		album_warm_pending = false;
+		unsigned generation = album_warm_generation;
+		char root[sizeof(album_warm_root)];
+		memcpy(root, album_warm_root, sizeof(root));
+		pthread_mutex_unlock(&album_warm_lock);
+
+		unsigned counts[COVER_THUMB_ERROR + 1] = {0};
+		uint32_t started = now_ms();
+		sqlite3_int64 after = 0;
+		char paths[ALBUM_WARM_BATCH][512];
+		while (album_warm_current(generation) && cover_cache_on_card(root)) {
+			int count = album_warm_paths(&after, paths);
+			for (int i = 0; i < count && album_warm_wait_for_audio(generation); i++) {
+				if (paths[i][0]) {
+					counts[cover_album_thumb(paths[i], NULL)]++;
+				}
+			}
+			if (count < ALBUM_WARM_BATCH) {
+				break;
+			}
+		}
+		if (counts[COVER_THUMB_HIT] || counts[COVER_THUMB_GENERATED] || counts[COVER_THUMB_NO_ART] ||
+			counts[COVER_THUMB_ERROR]) {
+			printf("cover: album warmup%s in %u ms, %u cached, %u prepared, %u no art, %u failed\n",
+				   album_warm_current(generation) ? "" : " interrupted", now_ms() - started, counts[COVER_THUMB_HIT],
+				   counts[COVER_THUMB_GENERATED], counts[COVER_THUMB_NO_ART], counts[COVER_THUMB_ERROR]);
+		}
+		pthread_mutex_lock(&album_warm_lock);
+	}
+	album_warm_running = false;
+	pthread_cond_broadcast(&album_warm_done);
+	pthread_mutex_unlock(&album_warm_lock);
+	return NULL;
+}
+
+static void album_warm_schedule(const char *root) {
+	if (!root || !root[0] || strlen(root) >= sizeof(album_warm_root)) {
+		return;
+	}
+	pthread_mutex_lock(&album_warm_lock);
+	if (album_warm_enabled) {
+		snprintf(album_warm_root, sizeof(album_warm_root), "%s", root);
+		album_warm_pending = true;
+		album_warm_generation++;
+		if (!album_warm_running) {
+			pthread_t thread;
+			if (pthread_create(&thread, NULL, album_warm_worker, NULL) == 0) {
+				album_warm_running = true;
+				pthread_detach(thread);
+			} else {
+				album_warm_pending = false;
+				fprintf(stderr, "cover: could not start album warmup\n");
+			}
+		}
+	}
+	pthread_mutex_unlock(&album_warm_lock);
+}
+
+static void album_warm_cancel(bool closing) {
+	pthread_mutex_lock(&album_warm_lock);
+	album_warm_pending = false;
+	album_warm_generation++;
+	if (closing) {
+		album_warm_enabled = false;
+		while (album_warm_running) {
+			pthread_cond_wait(&album_warm_done, &album_warm_lock);
+		}
+	}
+	pthread_mutex_unlock(&album_warm_lock);
+}
+
 bool library_open(const char *db_path) {
 	if (db) {
 		return true;
@@ -1422,6 +1554,9 @@ bool library_open(const char *db_path) {
 
 	printf("library: %s open, %d tracks indexed\n", db_path, library_track_count());
 
+	pthread_mutex_lock(&album_warm_lock);
+	album_warm_enabled = true;
+	pthread_mutex_unlock(&album_warm_lock);
 	sortkeys_start_backfill();
 	return true;
 }
@@ -1431,6 +1566,7 @@ static void finalize_statements(void);
 static void finalize_known(void);
 
 void library_close(void) {
+	album_warm_cancel(true);
 	// Waits, rather than just asking: a scan still in flight owns prepared
 	// statements, sqlite3_close() then answers SQLITE_BUSY and leaves the file
 	// open -- and on this device an open file on the card makes the unmount
@@ -2859,7 +2995,7 @@ static const char *row_by_id_sql(library_list_t kind, const char *value, char *o
 	case LIBRARY_LIST_FAVOURITES:
 		return "SELECT " FAV_NAME ", path, " FAV_ARTIST " FROM FAVOURITES WHERE rowid=?";
 	case LIBRARY_LIST_MOST_PLAYED:
-		return "SELECT " PLAYS_NAME ", path, " PLAYS_ARTIST " FROM PLAY_COUNTS WHERE rowid=?";
+		return "SELECT " PLAYS_NAME ", path, " PLAYS_ARTIST ", plays FROM PLAY_COUNTS WHERE rowid=?";
 	default:
 		return NULL;
 	}
@@ -3083,8 +3219,9 @@ static int row_slot(const struct library_index *ix, int index) {
 	return ix->desc ? ix->count - 1 - index : index;
 }
 
-int library_index_window(const library_index_t *ix, int offset, int count, library_row_cb cb, void *user) {
-	if (!ix || !cb || offset < 0 || count <= 0 || offset >= ix->count) {
+static int index_window(const library_index_t *ix, int offset, int count, library_row_cb cb,
+						library_play_count_row_cb plays_cb, void *user) {
+	if (!ix || (!cb && !plays_cb) || offset < 0 || count <= 0 || offset >= ix->count) {
 		return 0;
 	}
 	if (offset + count > ix->count) {
@@ -3112,20 +3249,21 @@ int library_index_window(const library_index_t *ix, int offset, int count, libra
 		for (int i = 0; i < count; i++) {
 			sqlite3_reset(stmt);
 			sqlite3_bind_int64(stmt, 1, ix->rows[row_slot(ix, offset + i)]);
-			if (sqlite3_step(stmt) != SQLITE_ROW) {
-				// The row went while the window was being read. The window is
-				// positional, so it gets a blank rather than the next row
-				// shifted into its place.
-				if (!cb("", NULL, NULL, user)) {
-					break;
+			// Keep a blank in the window if the row disappears mid-read,
+			// so the following rows stay in their original positions.
+			const char *name = NULL, *path = NULL, *artist = NULL;
+			long long plays = 0;
+			if (sqlite3_step(stmt) == SQLITE_ROW) {
+				name = (const char *)sqlite3_column_text(stmt, 0);
+				path = (const char *)sqlite3_column_text(stmt, 1);
+				artist = (const char *)sqlite3_column_text(stmt, 2);
+				if (plays_cb && ix->kind == LIBRARY_LIST_MOST_PLAYED) {
+					plays = sqlite3_column_int64(stmt, 3);
 				}
-				delivered++;
-				continue;
 			}
-			const char *name = (const char *)sqlite3_column_text(stmt, 0);
-			const char *path = (const char *)sqlite3_column_text(stmt, 1);
-			const char *artist = (const char *)sqlite3_column_text(stmt, 2);
-			if (!cb(name ? name : "", path, artist, user)) {
+			bool keep_going = plays_cb ? plays_cb(name ? name : "", path, artist, plays, user)
+									   : cb(name ? name : "", path, artist, user);
+			if (!keep_going) {
 				break;
 			}
 			delivered++;
@@ -3135,6 +3273,15 @@ int library_index_window(const library_index_t *ix, int offset, int count, libra
 
 	pthread_mutex_unlock(&db_lock);
 	return delivered;
+}
+
+int library_index_window(const library_index_t *ix, int offset, int count, library_row_cb cb, void *user) {
+	return index_window(ix, offset, count, cb, NULL, user);
+}
+
+int library_index_window_with_plays(const library_index_t *ix, int offset, int count,
+									library_play_count_row_cb cb, void *user) {
+	return index_window(ix, offset, count, NULL, cb, user);
 }
 
 library_index_t *library_index_clone(const library_index_t *ix) {
@@ -5150,8 +5297,9 @@ static void full_scan_run(void) {
 	pthread_mutex_lock(&db_lock);
 	if (scan_db_failed) {
 		exec("ROLLBACK"); // no-op when the BEGIN itself never took
-	} else {
-		exec("COMMIT");
+	} else if (!exec("COMMIT")) {
+		scan_db_failed = true;
+		exec("ROLLBACK");
 	}
 	finalize_statements();
 
@@ -6614,6 +6762,12 @@ static void *scan_thread_func(void *arg) {
 			if (scan_mode == SCAN_UPDATE && update_listener) {
 				update_listener(update_outcome, update_added, update_removed, update_replaced);
 			}
+			bool indexed = scan_mode == SCAN_FULL ||
+						   (scan_mode == SCAN_UPDATE && update_outcome == LIBRARY_UPDATE_FINISHED) ||
+						   (scan_mode == SCAN_REORGANIZE && album_warm_after_reorganize && done && !wanted);
+			if (indexed && !scan_cancel && !scan_db_failed) {
+				album_warm_schedule(scan_root);
+			}
 			scan_running = false;
 			pthread_mutex_unlock(&rules_lock);
 			break;
@@ -6630,6 +6784,10 @@ static bool scan_launch(const char *root, scan_mode_t mode) {
 		return false;
 	}
 
+	album_warm_after_reorganize = mode == SCAN_REORGANIZE && root && root[0];
+	if (mode != SCAN_REORGANIZE || album_warm_after_reorganize) {
+		album_warm_cancel(false);
+	}
 	if (root && root[0]) {
 		snprintf(scan_root, sizeof(scan_root), "%s", root);
 	}
@@ -6691,7 +6849,7 @@ static bool reorganize_when_done(bool notify) {
 	return waiting;
 }
 
-bool library_reorganize(void) {
+static bool library_reorganize_at(const char *root) {
 	if (!library_is_open() || library_track_count() == 0) {
 		return false;
 	}
@@ -6703,7 +6861,7 @@ bool library_reorganize(void) {
 	if (update_listener) {
 		update_listener(LIBRARY_UPDATE_REORGANIZING, 0, 0, 0);
 	}
-	if (scan_launch(NULL, SCAN_REORGANIZE) || reorganize_when_done(false)) {
+	if (scan_launch(root, SCAN_REORGANIZE) || reorganize_when_done(false)) {
 		return true;
 	}
 	if (update_listener) {
@@ -6711,6 +6869,8 @@ bool library_reorganize(void) {
 	}
 	return false;
 }
+
+bool library_reorganize(void) { return library_reorganize_at(NULL); }
 
 bool library_organize_check(void) {
 	if (!library_is_open() || library_track_count() == 0 || organized_as_set()) {
@@ -6740,7 +6900,11 @@ bool library_card_returned(const char *root) {
 	// changes.
 	bool unfiled = !organized_as_set();
 	if (!library_detect_changes()) {
-		return unfiled && library_organize_check();
+		if (unfiled && library_reorganize_at(root)) {
+			return true;
+		}
+		album_warm_schedule(root);
+		return false;
 	}
 	if (library_track_count() == 0) {
 		printf("library: detect changes: nothing indexed yet, a scan builds the library\n");

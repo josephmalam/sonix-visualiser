@@ -15,5 +15,7 @@ void corners_init(gui_config_t *cfg);
 
 bool corners_enabled(void);
 void corners_set_enabled(bool enabled);
+// Temporarily hide the masks for a screen that uses the full panel.
+void corners_set_suppressed(bool suppressed);
 
 #endif

@@ -5,10 +5,31 @@ LVGL.
 
 Everything it can do is in **[FEATURES.md](FEATURES.md)**.
 
+## Sonix Visualiser fork
+
+This fork adds an audio-reactive visualiser with adjustable ribbons, tunnel,
+sparks and anti-aliasing, plus an iPod-style Now Playing screen with a touch
+click wheel. It also adds a four-column album-art grid, background artwork
+preparation, faster Cover Flow with edge fades, play counts in Most Played,
+and a swipe-linked fade into lyrics.
+
+The ready-to-install **HiBy R1** image is on the
+[Sonix Visualiser releases page](https://github.com/josephmalam/sonix-visualiser/releases).
+Use the **From SD card** update route for these builds. The **Via internet**
+option in this build still checks the upstream Sonix Player releases. The
+features were exercised in the Linux simulator and the image was checked for
+the R1. Only the R1 firmware image is provided here.
+
+For source builds, follow the upstream build and packing instructions below.
+The [Cover Flow cache procedure](sonix-player/tools/coverflow-cache-test.md)
+covers cache hits, artwork changes, and interrupted preparation.
+
 ## Install
 
-1. Download the firmware for your player from the
-   **[latest release](https://github.com/Jepl4r/sonix-player/releases/latest)**:
+1. Download the firmware for your player. For this fork, get the **HiBy R1**
+   image from the [Sonix Visualiser releases page](https://github.com/josephmalam/sonix-visualiser/releases).
+   The [upstream Sonix Player releases](https://github.com/Jepl4r/sonix-player/releases/latest)
+   also provide firmware for both models:
    `r3proii.upt` for the R3 Pro II, `r1.upt` for the R1. **Never the other
    one**: the update does not check which player it is given.
 2. Charge the player **above 30%**.
@@ -22,9 +43,8 @@ Everything it can do is in **[FEATURES.md](FEATURES.md)**.
 5. Let it flash: it says "Upgrading...", then "Succeeded", and reboots by
    itself.
 
-Once Sonix Player is installed, later versions can be installed straight from
-the player: Settings > System > Update firmware > Via internet downloads the
-right file from the latest release by itself.
+For upstream Sonix Player builds, **Settings > System > Update firmware > Via
+internet** downloads the matching file from the upstream release.
 
 > **Going back to the stock firmware:** flash the original firmware from
 > HiBy's website the same way.

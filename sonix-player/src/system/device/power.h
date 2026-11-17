@@ -173,6 +173,9 @@ void power_hold_screen_on(bool hold);
 // of the two letting go does not release the other.
 void power_hold_screen_for_view(bool hold);
 
+// Hold while the visualiser is visible, independently of the player sheet.
+void power_hold_screen_for_visualiser(bool hold);
+
 // Stops charging once the battery reaches `percent` (80..100; 100 means no
 // limit). Whether this can be enforced depends on the charger driver exposing
 // a control node -- power_charge_limit_supported() says whether it found one.

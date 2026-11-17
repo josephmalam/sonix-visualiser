@@ -8,6 +8,7 @@
 // getter, and both places here have to read the period before changing it.
 #include "lvgl/src/misc/lv_timer_private.h"
 
+#include "src/system/audio/visualiser_audio.h"
 #include "src/system/audio/waveform.h"
 #include "src/system/device/ota.h"
 #include "src/system/device/system.h"
@@ -295,6 +296,7 @@ static uint32_t input_idle_ms(uint32_t now) {
 
 static bool g_screen_on_hold;
 static bool g_screen_view_hold; // see power_hold_screen_for_view
+static bool g_screen_visualiser_hold;
 
 // ---------------------------------------------------------------------------
 // charge limit
@@ -1480,6 +1482,7 @@ static bool (*g_wake_hook)(void);
 void power_set_wake_hook(bool (*cb)(void)) { g_wake_hook = cb; }
 
 void power_screen_off(void) {
+	visualiser_audio_set_screen_on(false);
 	waveform_set_screen_on(false); // told, but not a reason to stop -- see waveform.h
 	if (!g_screen_on) {
 		return;
@@ -1576,6 +1579,7 @@ void power_keep_animations_paused(void) {
 }
 
 void power_screen_on(void) {
+	visualiser_audio_set_screen_on(true);
 	waveform_set_screen_on(true);
 	if (g_screen_on) {
 		return;
@@ -1775,7 +1779,7 @@ static void power_timer_cb(lv_timer_t *timer) {
 	uint32_t off_idle_wall = boottime_ms() - g_last_active_boot_ms;
 
 	// 4. auto screen-off after the configured input-idle timeout
-	if (g_screen_on && g_cfg.screen_off_enabled && !g_screen_on_hold && !g_screen_view_hold &&
+	if (g_screen_on && g_cfg.screen_off_enabled && !g_screen_on_hold && !g_screen_view_hold && !g_screen_visualiser_hold &&
 		input_idle >= g_cfg.screen_off_timeout_ms) {
 		// Say why. A screen that goes dark on its own is indistinguishable
 		// from a crash unless the log records that it was the idle timer.
@@ -1877,6 +1881,16 @@ void power_hold_screen_for_view(bool hold) {
 		if (g_disp) {
 			lv_display_trigger_activity(g_disp);
 		}
+	}
+}
+
+void power_hold_screen_for_visualiser(bool hold) {
+	if (hold == g_screen_visualiser_hold) {
+		return;
+	}
+	g_screen_visualiser_hold = hold;
+	if (!hold) {
+		power_notify_activity();
 	}
 }
 

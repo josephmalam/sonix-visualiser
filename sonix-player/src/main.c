@@ -2014,13 +2014,13 @@ int main(int argc, char **argv) {
 	// taking over that job, which is what manage_mount does; the player still
 	// stays out of the way if it finds the card already mounted.
 	storage_config_t storage_cfg = {
-		// Both NULL: the player probes the block devices and the mount-point
-		// names the stock firmware uses and reports what it found in the log.
 		.device = NULL,
-		.mount_point = NULL,
 #ifdef HOST_BUILD
-		.manage_mount = false, // never touch the developer's own filesystem
+		.mount_point = music_path,
+		.manage_mount = false, // never mount or unmount on the host
 #else
+		// Probe for the block device and mount point used by the stock firmware.
+		.mount_point = NULL,
 		.manage_mount = true,
 #endif
 	};
@@ -2403,6 +2403,7 @@ int main(int argc, char **argv) {
 		}
 	}
 
+	library_close();
 	printf("\n");
 
 	return 0;

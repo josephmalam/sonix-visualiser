@@ -1366,6 +1366,8 @@ static lv_obj_t *lyrics_head_artist;
 static cover_image_t lyrics_screen_pic; // the blurred sleeve at the shape of the screen
 static unsigned lyrics_bg_generation;
 static int32_t lyrics_progress; // 0 the sleeve, LYRICS_FULL the words
+static int32_t lyrics_bg_ready = LV_OPA_COVER;
+static lv_opa_t lyrics_bg_opacity;
 // A line tapped: where it plays from, and until when the column waits for the
 // player to get there rather than follow the position from before the jump.
 static int32_t lyrics_tap_ms = -1;
@@ -1597,7 +1599,7 @@ static void lyrics_paint_line(int index, bool lit) {
 		return;
 	}
 	lv_obj_t *label = lv_obj_get_child(lyrics_view, index);
-	// Unlit, the line wears the column's colour (see lyrics_look()).
+	// Unlit, the line wears the column's colour (see lyrics_ink_sync()).
 	if (lit) {
 		lv_obj_set_style_text_color(label, chrome_accent(), 0);
 	} else {
@@ -1678,45 +1680,57 @@ static void lyrics_head_sync(void) {
 	scrolltext_set(lyrics_head_artist, lv_label_get_text(song_artist_label));
 }
 
-// Studio's look for the arrangements that are not Studio: its blurred
-// sleeve behind the whole screen, and the surfaces that would cover it --
-// the sleeve's panel and the controls' own blurred block -- made clear. Put on
-// in one step when the words start to come in, not faded with the finger: a
-// screen-sized blend redrawn on every frame of the swipe is what this
-// processor cannot keep up with. Only with a picture to show; without one the
-// page keeps its own background, whole, and the words take the theme's
-// colours.
-static bool lyrics_look_on;
-
-static void lyrics_look(bool on) {
+static void lyrics_backdrop_apply(void) {
 	if (layout_studio_now) {
-		on = false; // Studio is the look already
+		lyrics_bg_opacity = LV_OPA_TRANSP;
+		return; // Studio already has an upright backdrop
 	}
 	const lv_image_dsc_t *backdrop = lyrics_backdrop();
-	if (on && !backdrop) {
-		on = false;
+	lv_opa_t opacity = backdrop ? (lyrics_progress * lyrics_bg_ready + LYRICS_FULL / 2) / LYRICS_FULL
+								: LV_OPA_TRANSP;
+	if (opacity == lyrics_bg_opacity) {
+		return;
 	}
-	if (on) {
-		lv_image_set_src(studio_bg, backdrop);
-		lv_obj_set_hidden(studio_bg, false);
-		lv_obj_move_background(studio_bg);
-		lv_obj_set_style_bg_opa(cover_panel, LV_OPA_TRANSP, 0);
-		lv_obj_set_style_bg_opa(player_menu, LV_OPA_TRANSP, 0);
-		lv_obj_set_style_bg_image_opa(player_menu, LV_OPA_TRANSP, 0);
-	} else if (lyrics_look_on && !layout_studio_now) {
+	if (opacity > LV_OPA_TRANSP) {
+		if (lyrics_bg_opacity == LV_OPA_TRANSP) {
+			lv_image_set_src(studio_bg, backdrop);
+			lv_obj_set_hidden(studio_bg, false);
+			lv_obj_move_background(studio_bg);
+		}
+		// Draw the upright image opaque underneath. The sleeve panel's solid
+		// fill and the controls' reflection share a fade, with just one blend
+		// per region. The reflection covers the controls' own fill.
+		lv_opa_t outgoing = LV_OPA_COVER - opacity;
+		lv_obj_set_style_bg_opa(cover_panel, outgoing, 0);
+		lv_obj_set_style_bg_opa(player_menu, current_backdrop.pixels ? LV_OPA_TRANSP : outgoing, 0);
+		lv_obj_set_style_bg_image_opa(player_menu, outgoing, 0);
+	} else {
 		lv_obj_set_hidden(studio_bg, true);
 		lv_obj_remove_local_style_prop(cover_panel, LV_STYLE_BG_OPA, 0);
 		lv_obj_remove_local_style_prop(player_menu, LV_STYLE_BG_OPA, 0);
 		lv_obj_remove_local_style_prop(player_menu, LV_STYLE_BG_IMAGE_OPA, 0);
 	}
-	lyrics_look_on = on;
+	lyrics_bg_opacity = opacity;
+}
+
+static void lyrics_backdrop_ready_exec(void *obj, int32_t opacity) {
+	(void)obj;
+	lyrics_bg_ready = opacity;
+	lyrics_backdrop_apply();
+}
+
+static void lyrics_ink_sync(void) {
+	if (!lyrics_pane) {
+		return;
+	}
 	// The words are white over a blurred sleeve, and in the theme's own
 	// colour over the page's own background where there is no picture.
-	lv_color_t ink = lyrics_backdrop() ? lv_color_white() : theme()->text_primary;
+	bool have_art = lyrics_backdrop() != NULL;
+	lv_color_t ink = have_art ? lv_color_white() : theme()->text_primary;
 	lv_obj_set_style_text_color(lyrics_view, ink, 0);
 	lv_obj_set_style_text_color(lyrics_note, ink, 0);
 	lv_obj_set_style_text_color(lyrics_head_title, ink, 0);
-	lv_obj_set_style_text_color(lyrics_head_artist, lyrics_backdrop() ? lv_color_make(200, 200, 200) : theme()->text_secondary, 0);
+	lv_obj_set_style_text_color(lyrics_head_artist, have_art ? lv_color_make(200, 200, 200) : theme()->text_secondary, 0);
 }
 
 // What travels with the sleeve: it goes out to the left as the words come in.
@@ -1802,9 +1816,8 @@ static void lyrics_find_sync(bool full) {
 }
 
 // Everything the swipe moves, at `progress` of the way from the sleeve (0)
-// to the words (LYRICS_FULL). Only positions change from one frame to the
-// next; at 0 every style touched is handed back, so the arrangement is
-// exactly what it was before the first swipe.
+// to the words (LYRICS_FULL). Positions and the backdrop fade follow the
+// same progress, including when a partial swipe settles back to the sleeve.
 static void lyrics_progress_apply(int32_t progress) {
 	if (!lyrics_pane) {
 		return;
@@ -1828,9 +1841,7 @@ static void lyrics_progress_apply(int32_t progress) {
 	}
 	lyrics_screen_hold_update();
 	lv_obj_set_x(lyrics_pane, lyrics_pane_x + travel * (LYRICS_FULL - progress) / LYRICS_FULL);
-	if (rest || !lyrics_look_on) {
-		lyrics_look(!rest);
-	}
+	lyrics_backdrop_apply();
 
 	int32_t away = -(int32_t)cover_box_w * progress / LYRICS_FULL;
 	if (layout_studio_now) {
@@ -1959,6 +1970,7 @@ static void lyrics_layout(void) {
 		lv_obj_set_size(lyrics_head, cover_box_w - 2 * STUDIO_MARGIN, STUDIO_HEAD_H);
 	}
 	lyrics_progress_apply(lyrics_now ? LYRICS_FULL : 0);
+	lyrics_ink_sync();
 }
 
 // Brings the page up, or puts it away, and remembers it either way: it stays
@@ -2474,8 +2486,17 @@ static void lyrics_bg_arrived(void *user) {
 		cover_free(&lyrics_screen_pic);
 		lyrics_screen_pic = job->out;
 		lyrics_screen_pic.dsc.data = lyrics_screen_pic.pixels; // struct moved, buffer didn't
-		if (lyrics_progress > 0) {
-			lyrics_look(true);
+		lyrics_ink_sync();
+		if (lyrics_progress > 0 && !layout_studio_now) {
+			// If the swipe beat the blur worker, ease in the result too.
+			lyrics_bg_ready = LV_OPA_TRANSP;
+			lv_anim_t a;
+			lv_anim_init(&a);
+			lv_anim_set_var(&a, &lyrics_screen_pic);
+			lv_anim_set_exec_cb(&a, lyrics_backdrop_ready_exec);
+			lv_anim_set_values(&a, LV_OPA_TRANSP, LV_OPA_COVER);
+			lv_anim_set_duration(&a, LYRICS_SLIDE_MS);
+			lv_anim_start(&a);
 		}
 	} else {
 		cover_free(&job->out);
@@ -2498,13 +2519,14 @@ static void *lyrics_bg_worker(void *arg) {
 // with it while the words are up.
 static void lyrics_bg_forget(void) {
 	lyrics_bg_generation++;
-	if (lyrics_look_on && !layout_studio_now) {
-		lyrics_look(false);
-	}
+	lv_anim_delete(&lyrics_screen_pic, lyrics_backdrop_ready_exec);
 	if (!layout_studio_now && studio_bg && lv_image_get_src(studio_bg) == &lyrics_screen_pic.dsc) {
 		lv_image_set_src(studio_bg, NULL);
 	}
 	cover_free(&lyrics_screen_pic);
+	lyrics_bg_ready = LV_OPA_COVER;
+	lyrics_backdrop_apply();
+	lyrics_ink_sync();
 }
 
 // Starts the blur of the sleeve just put up. Not in Studio, which has its own
@@ -3448,9 +3470,7 @@ static void apply_cover_result(void) {
 		lyrics_bg_forget(); // no picture, nothing to blur
 	}
 	bar_over_player_update();
-	if (lyrics_progress > 0) {
-		lyrics_look(true); // Studio's backdrop has arrived, or there is none
-	}
+	lyrics_ink_sync();
 	cover_incoming_id = 0;
 
 	// Studio draws both of these itself -- the sleeve smaller and the blurred
@@ -3518,9 +3538,7 @@ static void player_refresh_theme(void) {
 	device_state_t state;
 	device_state_get(&state);
 	refresh_cover(state.current_file);
-	if (lyrics_pane) {
-		lyrics_look(lyrics_look_on); // the words in the new theme's colours
-	}
+	lyrics_ink_sync();
 }
 
 static void update_qobuz_badge(void);
@@ -4255,9 +4273,7 @@ static void update_progress(void) {
 	device_state_remember_note();
 }
 
-static void play_btn_event_cb(lv_event_t *e) {
-	(void)e;
-
+void player_screen_play_pause(void) {
 	// A live stream has no position to come back to, so this is a stop, not a
 	// pause: the connection goes, the station stays on screen, and pressing
 	// play again reconnects to it. Not while it is still connecting.
@@ -4276,6 +4292,11 @@ static void play_btn_event_cb(lv_event_t *e) {
 
 	audio_status_t new_status = device_state_toggle_play_pause();
 	apply_playback_status(new_status); // optimistic UI update; next poll reconciles against the real status
+}
+
+static void play_btn_event_cb(lv_event_t *e) {
+	(void)e;
+	player_screen_play_pause();
 }
 
 // What the on-screen prev/next buttons do. On a book or a podcast they are

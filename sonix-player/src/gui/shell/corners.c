@@ -20,6 +20,7 @@ static lv_obj_t *corner[4];
 static uint8_t pixels[4][CORNER_RADIUS * CORNER_RADIUS];
 static lv_image_dsc_t image[4];
 static bool enabled;
+static bool suppressed;
 
 // The share of the pixel that lies outside the circle, as alpha. Worked out for
 // the top-left corner, whose arc is centred on (CORNER_RADIUS, CORNER_RADIUS),
@@ -99,11 +100,12 @@ static void create_corners(void) {
 }
 
 static void apply(void) {
-	if (enabled) {
+	bool visible = enabled && !suppressed;
+	if (visible) {
 		create_corners();
 	}
 	for (int i = 0; i < 4 && corner[i]; i++) {
-		lv_obj_set_hidden(corner[i], !enabled);
+		lv_obj_set_hidden(corner[i], !visible);
 	}
 }
 
@@ -125,4 +127,11 @@ void corners_set_enabled(bool on) {
 	config_set_int("ui", "rounded_corners", on ? 1 : 0);
 	config_save();
 	apply();
+}
+
+void corners_set_suppressed(bool on) {
+	if (on != suppressed) {
+		suppressed = on;
+		apply();
+	}
 }

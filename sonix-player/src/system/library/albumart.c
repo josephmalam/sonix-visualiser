@@ -1165,41 +1165,7 @@ bool albumart_load_for_file(const char *filepath, albumart_t *out) {
 	return false;
 }
 
-bool albumart_load_candidate(const char *filepath, int index, albumart_t *out) {
-	memset(out, 0, sizeof(*out));
-
-	if (index < 0 || index >= ALBUMART_CANDIDATES)
-		return false;
-
-	// A track of a CUE sheet has no artwork of its own: the picture belongs to
-	// the file the sheet cuts up, or sits in the folder beside it.
-	//
-	// The sheet is on the heap, not the stack: cue_sheet_t is 35 KB, the
-	// compiler would reserve it on entry whether or not this branch is taken,
-	// and this function recurses -- 70 KB of loader-thread stack for a case
-	// that fires only on a `.cue?track=` path.
-	char sheet_path[512];
-	if (cue_split_path(filepath, sheet_path, sizeof(sheet_path)) > 0) {
-		cue_sheet_t *cue = malloc(sizeof(*cue));
-		if (!cue) {
-			return false;
-		}
-		bool ok = cue_parse(sheet_path, cue) && albumart_load_candidate(cue->audio_path, index, out);
-		free(cue);
-		return ok;
-	}
-
-	// The path IS a picture. There is no track here to read tags from and no
-	// folder to search: a radio station's downloaded icon is simply the
-	// artwork, and the player asks for it by path like any other cover.
-	if (has_extension(filepath, ".jpg") || has_extension(filepath, ".jpeg") || has_extension(filepath, ".png")) {
-		return index == 0 && read_whole_file(filepath, out);
-	}
-
-	if (index == 0) {
-		return read_embedded(filepath, out);
-	}
-
+static bool find_track_cover(const char *filepath, char *out, size_t size) {
 	// A cover image file sitting next to the track.
 	char dirpath[1024];
 	strncpy(dirpath, filepath, sizeof(dirpath) - 1);
@@ -1224,9 +1190,60 @@ bool albumart_load_candidate(const char *filepath, int index, albumart_t *out) {
 	if (dirpath[0] == '\0')
 		strncpy(dirpath, "/", sizeof(dirpath) - 1);
 
-	char cover_path[1300];
-	if (find_cover_file(dirpath, stem, cover_path, sizeof(cover_path)))
-		return read_whole_file(cover_path, out);
+	return find_cover_file(dirpath, stem, out, size);
+}
 
-	return false;
+// Resolve virtual CUE tracks to the audio file that supplies both candidates.
+static bool cue_audio_path(const char *sheet_path, char *out, size_t size) {
+	cue_sheet_t *cue = malloc(sizeof(*cue));
+	if (!cue) {
+		return false;
+	}
+	bool ok = cue_parse(sheet_path, cue) && snprintf(out, size, "%s", cue->audio_path) < (int)size;
+	free(cue);
+	return ok;
+}
+
+bool albumart_track_sources(const char *path, char *audio, size_t audio_size, char *sidecar, size_t sidecar_size) {
+	char sheet[512];
+	bool ok = cue_split_path(path, sheet, sizeof(sheet)) > 0
+				  ? cue_audio_path(sheet, audio, audio_size)
+				  : snprintf(audio, audio_size, "%s", path) < (int)audio_size;
+	if (!ok) {
+		return false;
+	}
+	sidecar[0] = '\0';
+	if (!is_image_name(audio)) {
+		find_track_cover(audio, sidecar, sidecar_size);
+	}
+	return true;
+}
+
+bool albumart_load_candidate(const char *filepath, int index, albumart_t *out) {
+	memset(out, 0, sizeof(*out));
+
+	if (index < 0 || index >= ALBUMART_CANDIDATES)
+		return false;
+
+	// A track of a CUE sheet has no artwork of its own: the picture belongs to
+	// the file the sheet cuts up, or sits in the folder beside it.
+	char sheet_path[512];
+	if (cue_split_path(filepath, sheet_path, sizeof(sheet_path)) > 0) {
+		char audio[1024];
+		return cue_audio_path(sheet_path, audio, sizeof(audio)) && albumart_load_candidate(audio, index, out);
+	}
+
+	// The path IS a picture. There is no track here to read tags from and no
+	// folder to search: a radio station's downloaded icon is simply the
+	// artwork, and the player asks for it by path like any other cover.
+	if (has_extension(filepath, ".jpg") || has_extension(filepath, ".jpeg") || has_extension(filepath, ".png")) {
+		return index == 0 && read_whole_file(filepath, out);
+	}
+
+	if (index == 0) {
+		return read_embedded(filepath, out);
+	}
+
+	char cover_path[1300];
+	return find_track_cover(filepath, cover_path, sizeof(cover_path)) && read_whole_file(cover_path, out);
 }

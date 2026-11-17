@@ -27,7 +27,9 @@
 // takes 90; the podcasts on the card take 91..102 for their twelve rows, 103
 // for the cover at the head of one of them and 104..107 for the episodes being
 // listened to -- so the pools never trample each other's requests.
-#define COVERLOADER_SLOTS 108
+#define COVERLOADER_ALBUM_GRID_BASE 108
+#define COVERLOADER_ALBUM_GRID_COUNT 36
+#define COVERLOADER_SLOTS (COVERLOADER_ALBUM_GRID_BASE + COVERLOADER_ALBUM_GRID_COUNT)
 #define COVERLOADER_SEARCH_BASE 36
 #define COVERLOADER_SEARCH_COUNT 24
 #define COVERLOADER_AUDIOBOOKS_BASE 60
@@ -38,6 +40,7 @@
 // bigger pictures than any list does -- 210 px against the lists' 72 -- but
 // never more than six at a time, and only while its page is the one on screen.
 #define COVERLOADER_COVERFLOW_BASE 84
+#define COVERLOADER_COVERFLOW_COUNT 6
 
 // The big cover above an album's tracks, when the album page is laid out with
 // one (Music > Library). One picture, the size of most of the
@@ -50,6 +53,9 @@ void coverloader_start(void);
 // Asks for the artwork of `path` at `size` pixels, for `slot`. Returns
 // immediately. Any earlier request on this slot is abandoned.
 void coverloader_request(int slot, const char *path, int size);
+
+// Give the Cover Flow slot nearest the centre first choice of the next job.
+void coverloader_prioritize(int slot);
 
 // The same, with the picture made from the player's own cover of the file at
 // player_w x player_h and scaled to `size` (cover_load_shared): the player's

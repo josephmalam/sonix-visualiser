@@ -10,6 +10,7 @@
 
 #include "src/gui/library/browser.h"
 #include "src/gui/nowplaying/coverflow.h"
+#include "src/gui/nowplaying/ipodmode.h"
 #include "src/gui/settings/ccsettings.h"
 #include "src/gui/nowplaying/chapters.h"
 #include "src/gui/nowplaying/lyricsearch.h"
@@ -577,6 +578,11 @@ static void power_menu_async_cb(void *unused) {
 void gui_notify_power_menu(void) { gui_post(power_menu_async_cb, NULL); }
 
 
+static void release_player_artwork(void) {
+	screensaver_release_artwork();
+	ipod_mode_release_artwork();
+}
+
 void gui_init(gui_config_t *cfg) {
 	// Colours first: every screen below styles itself from the active palette.
 	theme_init();
@@ -780,7 +786,7 @@ void gui_init(gui_config_t *cfg) {
 	// player tells it to let go of the artwork before freeing it, because a
 	// track can change while the screensaver sits behind a blanked panel.
 	power_set_wake_hook(screensaver_prepare);
-	player_set_cover_release_cb(screensaver_release_artwork);
+	player_set_cover_release_cb(release_player_artwork);
 
 	// The notice card: the interface's card style, wrapping, and only as tall
 	// as what it has to say.
