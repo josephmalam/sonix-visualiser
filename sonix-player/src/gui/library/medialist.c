@@ -48,6 +48,9 @@ lv_obj_t *medialist_albums_screen;
 #define ALBUM_GRID_COLUMNS 4
 #define ALBUM_GRID_GAP 4
 #define ALBUM_GRID_POLL_MS 25
+#define ALBUM_GRID_AHEAD_ROWS 12
+#define ALBUM_GRID_BEHIND_ROWS 2
+#define ALBUM_ART_FADE_MS 200
 
 // How many rows are held in RAM for a query-backed list: the twelve on screen
 // plus enough either side that a flick does not fetch on every frame. At about
@@ -182,6 +185,7 @@ typedef struct {
 	char path[512];
 	char artist[128]; // a track's artist, an album's; empty on the other lists
 	long long plays;
+	bool favourite;
 	bool has_path;
 } winrow_t;
 
@@ -191,10 +195,11 @@ typedef struct {
 	lv_obj_t *number; // the track number, where the cover is, in the album head layout; NULL on name rows
 	lv_obj_t *text;	 // title and badge, stacked, so one does not sit on the other
 	lv_obj_t *label;
+	lv_obj_t *title_line, *title_star, *detail_star, *detail_spacer;
 	lv_obj_t *detail;	// the line under the title: the badge and the artist
 	lv_obj_t *quality;	// ...the badge, on track rows; NULL elsewhere
 	lv_obj_t *artist;	// ...and the artist, where "Show artist" asks for it
-	lv_obj_t *plays;		// ...and the count in Most Played
+	lv_obj_t *plays;		// ...and the play count
 	lv_obj_t *menu_btn; // the ellipsis on track rows; NULL on name lists
 	lv_obj_t *chevron;	// the chevron on name rows; NULL on track rows
 	lv_obj_t *check;	// the tick on a chosen row in selection mode
@@ -257,6 +262,7 @@ typedef struct {
 	winrow_t *window; // WINDOW_ROWS of them, allocated once with the panel
 	int window_first; // index of window[0]; -1 when nothing is cached
 	int window_count;
+	unsigned stats_revision;
 
 	// Path-backed lists only, with a count of its own: p->count below is the
 	// length of the LIST, which for a query-backed one comes from the handle
@@ -413,6 +419,7 @@ static bool album_view = true;
 // thing on every row, and a library of mp3s would wear the same badge all the
 // way down.
 static bool quality_badges;
+static bool show_play_counts = true;
 
 // "Go to the current track": the five lists the Music page opens start at the
 // row of whatever is playing. Off by default.
@@ -446,6 +453,7 @@ static void load_view_settings(void) {
 	view_settings_loaded = true;
 	album_view = config_get_int("library", "album_view", 1) != 0;
 	quality_badges = config_get_int("library", "quality_badges", 0) != 0;
+	show_play_counts = config_get_bool("library", "show_play_counts", true);
 	show_artist = config_get_int("library", "show_artist", 0) != 0;
 	go_to_current = config_get_int("library", "go_to_current", 0) != 0;
 	album_head = config_get_int("library", "album_head", 0) != 0;
@@ -615,7 +623,7 @@ typedef struct {
 	int filled;
 } window_fill_t;
 
-static bool window_fill_cb(const char *name, const char *path, const char *artist, long long plays, void *user) {
+static bool window_fill_cb(const char *name, const char *path, const char *artist, long long plays, bool favourite, void *user) {
 	window_fill_t *fill = user;
 	if (fill->filled >= WINDOW_ROWS) {
 		return false;
@@ -626,6 +634,7 @@ static bool window_fill_cb(const char *name, const char *path, const char *artis
 	snprintf(row->path, sizeof(row->path), "%s", path ? path : "");
 	snprintf(row->artist, sizeof(row->artist), "%s", artist ? artist : "");
 	row->plays = plays;
+	row->favourite = favourite;
 	return true;
 }
 
@@ -700,7 +709,7 @@ static bool window_cover(panel_t *p, int index) {
 	}
 
 	window_fill_t fill = {.panel = p, .filled = 0};
-	library_index_window_with_plays(p->ix, first, WINDOW_ROWS, window_fill_cb, &fill);
+	library_index_window_with_details(p->ix, first, WINDOW_ROWS, window_fill_cb, &fill);
 	p->window_first = first;
 	p->window_count = fill.filled;
 	return index >= first && index < first + fill.filled;
@@ -896,6 +905,25 @@ static const lv_image_dsc_t *glyph_for(const panel_t *p) {
 	}
 }
 
+static void album_art_opa_cb(void *obj, int32_t opacity) {
+	lv_obj_set_style_image_opa(obj, (lv_opa_t)opacity, 0);
+}
+
+static void album_art_fade_in(lv_obj_t *image) {
+	lv_anim_t fade;
+	lv_anim_init(&fade);
+	lv_anim_set_var(&fade, image);
+	lv_anim_set_exec_cb(&fade, album_art_opa_cb);
+	lv_anim_set_values(&fade, LV_OPA_TRANSP, LV_OPA_COVER);
+	lv_anim_set_duration(&fade, ALBUM_ART_FADE_MS);
+	lv_anim_start(&fade);
+}
+
+static void album_art_reset_opacity(lv_obj_t *image) {
+	lv_anim_delete(image, album_art_opa_cb);
+	lv_obj_set_style_image_opa(image, LV_OPA_COVER, 0);
+}
+
 static void row_show_glyph(panel_t *p, row_t *row) {
 	lv_image_set_src(row->icon, glyph_for(p));
 	lv_obj_add_style(row->icon, &theme_style_icon, 0);
@@ -933,6 +961,7 @@ static void row_drop_thumb(panel_t *p, row_t *row) {
 	coverloader_release(row_slot(p, row));
 
 	if (row->has_thumb) {
+		album_art_reset_opacity(row->icon);
 		row_show_glyph(p, row); // stop pointing at the pixels before they go
 		cover_free(&row->thumb);
 		row->has_thumb = false;
@@ -1142,16 +1171,25 @@ static void row_update_detail(panel_t *p, row_t *row, int index, const char *pat
 	row_update_quality(p, row, path);
 
 	long long plays = 0;
-	if (row->plays && p->kind == LIBRARY_LIST_MOST_PLAYED && window_cover(p, index)) {
-		plays = p->window[index - p->window_first].plays;
-		if (plays > 0) {
+	bool favourite = false;
+	bool count_shown = row->plays && show_play_counts;
+	if (p->is_tracks) {
+		if (p->from_paths) library_track_stats(path, &plays, &favourite);
+		else if (window_cover(p, index)) {
+			winrow_t *entry = &p->window[index - p->window_first];
+			plays = entry->plays;
+			favourite = entry->favourite;
+		}
+	}
+	if (row->plays) {
+		if (count_shown) {
 			char count[64];
 			snprintf(count, sizeof(count), tr(plays == 1 ? "%lld play" : "%lld plays"), plays);
 			lv_label_set_text(row->plays, count);
 		}
-	}
-	if (row->plays) {
-		lv_obj_set_hidden(row->plays, plays <= 0);
+		lv_obj_set_hidden(row->plays, !count_shown);
+		lv_obj_set_hidden(row->title_star, !favourite || count_shown);
+		lv_obj_set_hidden(row->detail_star, !favourite || !count_shown);
 	}
 
 	const char *artist = panel_shows_artist(p) ? row_artist_at(p, index) : NULL;
@@ -1166,9 +1204,10 @@ static void row_update_detail(panel_t *p, row_t *row, int index, const char *pat
 	} else {
 		lv_obj_set_hidden(row->artist, true);
 	}
+	if (row->detail_spacer) lv_obj_set_hidden(row->detail_spacer, artist || !count_shown);
 
 	bool badge = row->quality && !lv_obj_is_hidden(row->quality);
-	if (badge || artist || plays > 0) {
+	if (badge || artist || count_shown) {
 		lv_obj_set_hidden(row->detail, false);
 	} else {
 		lv_obj_set_hidden(row->detail, true);
@@ -1927,6 +1966,9 @@ static void thumbs_update(panel_t *p) {
 				row->has_thumb = true;
 				row->thumb_settled = true;
 				row_show_cover(row, &row->thumb.dsc);
+				if (on_screen && p->is_tracks && p->filter == LIBRARY_FILTER_ALBUM) {
+					album_art_fade_in(row->icon);
+				}
 			} else if (finished) {
 				row->thumb_settled = true; // no artwork in this file
 			} else {
@@ -1955,6 +1997,8 @@ typedef struct {
 } album_tile_t;
 
 static album_tile_t album_tiles[COVERLOADER_ALBUM_GRID_COUNT];
+static int album_grid_scroll;
+static int album_grid_direction = 1;
 
 static int tile_slot(const album_tile_t *tile) {
 	return COVERLOADER_ALBUM_GRID_BASE + (int)(tile - album_tiles);
@@ -1967,6 +2011,7 @@ static void album_tile_clear(album_tile_t *tile) {
 	if (tile->pending) {
 		coverloader_release(tile_slot(tile));
 	}
+	album_art_reset_opacity(tile->image);
 	lv_image_set_src(tile->image, &icon_album);
 	lv_obj_set_style_image_recolor_opa(tile->image, LV_OPA_COVER, 0);
 	cover_free(&tile->cover);
@@ -1979,6 +2024,8 @@ static void album_grid_clear(void) {
 	for (int i = 0; i < COVERLOADER_ALBUM_GRID_COUNT; i++) {
 		album_tile_clear(&album_tiles[i]);
 	}
+	album_grid_scroll = 0;
+	album_grid_direction = 1;
 }
 
 static void album_tile_click(lv_event_t *e) {
@@ -2026,11 +2073,26 @@ static void album_grid_update(panel_t *p) {
 	int size = grid_size(p);
 	int top = lv_obj_get_scroll_y(p->list);
 	top = top > 0 ? top : 0;
-	int first = top / pitch * ALBUM_GRID_COLUMNS;
-	int last = (top + lv_obj_get_height(p->list) - 1) / pitch * ALBUM_GRID_COLUMNS + ALBUM_GRID_COLUMNS;
+	if (top != album_grid_scroll) {
+		album_grid_direction = top > album_grid_scroll ? 1 : -1;
+	}
+	album_grid_scroll = top;
+	int visible_first = top / pitch * ALBUM_GRID_COLUMNS;
+	int visible_last = (top + lv_obj_get_height(p->list) - 1) / pitch * ALBUM_GRID_COLUMNS + ALBUM_GRID_COLUMNS;
+	if (visible_last > p->count) {
+		visible_last = p->count;
+	}
+	int above = album_grid_direction > 0 ? ALBUM_GRID_BEHIND_ROWS : ALBUM_GRID_AHEAD_ROWS;
+	int below = album_grid_direction > 0 ? ALBUM_GRID_AHEAD_ROWS : ALBUM_GRID_BEHIND_ROWS;
+	int first = visible_first - above * ALBUM_GRID_COLUMNS;
+	if (first < 0) {
+		first = 0;
+	}
+	int last = visible_last + below * ALBUM_GRID_COLUMNS;
 	if (last > p->count) {
 		last = p->count;
 	}
+	// Keep the modulo mapping collision-free even on a taller simulator panel.
 	if (last - first > COVERLOADER_ALBUM_GRID_COUNT) {
 		last = first + COVERLOADER_ALBUM_GRID_COUNT;
 	}
@@ -2043,34 +2105,69 @@ static void album_grid_update(panel_t *p) {
 	}
 
 	bool pending = false;
-	for (int index = first; index < last; index++) {
-		album_tile_t *tile = &album_tiles[index % COVERLOADER_ALBUM_GRID_COUNT];
-		if (!tile->button) {
-			album_tile_create(p, tile, size);
+	bool visible_pending = false;
+	bool preload_pending = false;
+	int priority = -1;
+	// Bind the visible rows first. Offscreen work is requested one image at a
+	// time, nearest first, so it cannot queue ahead of newly visible covers.
+	for (int pass = 0; pass < 3; pass++) {
+		int begin = visible_first, end = visible_last, step = 1;
+		if (pass > 0) {
+			bool downward = (pass == 1) == (album_grid_direction > 0);
+			begin = downward ? visible_last : visible_first - 1;
+			end = downward ? last : first - 1;
+			step = downward ? 1 : -1;
 		}
-		if (tile->index != index) {
-			const char *source;
-			if (!row_at(p, index, NULL, &source)) {
+		for (int index = begin; index != end; index += step) {
+			if (index < first || index >= last) {
 				continue;
 			}
-			tile->index = index;
-			lv_obj_set_pos(tile->button, index % ALBUM_GRID_COLUMNS * pitch, row_y(p, index));
-			lv_obj_set_hidden(tile->button, false);
-			if (source) {
-				coverloader_request(tile_slot(tile), source, size);
-				tile->pending = true;
+			album_tile_t *tile = &album_tiles[index % COVERLOADER_ALBUM_GRID_COUNT];
+			if (!tile->button) {
+				album_tile_create(p, tile, size);
 			}
-		}
+			if (tile->index != index) {
+				if (pass > 0 && (visible_pending || preload_pending)) {
+					pending = true;
+					continue;
+				}
+				const char *source;
+				if (!row_at(p, index, NULL, &source)) {
+					continue;
+				}
+				tile->index = index;
+				lv_obj_set_pos(tile->button, index % ALBUM_GRID_COLUMNS * pitch, row_y(p, index));
+				lv_obj_set_hidden(tile->button, false);
+				if (source) {
+					coverloader_request(tile_slot(tile), source, size);
+					tile->pending = true;
+				}
+			}
 
-		if (tile->pending) {
-			bool finished;
-			if (coverloader_take(tile_slot(tile), &tile->cover, &finished)) {
-				lv_obj_set_style_image_recolor_opa(tile->image, LV_OPA_TRANSP, 0);
-				lv_image_set_src(tile->image, &tile->cover.dsc);
+			if (tile->pending) {
+				bool finished;
+				if (coverloader_take(tile_slot(tile), &tile->cover, &finished)) {
+					lv_obj_set_style_image_recolor_opa(tile->image, LV_OPA_TRANSP, 0);
+					lv_image_set_src(tile->image, &tile->cover.dsc);
+					album_art_fade_in(tile->image);
+				}
+				tile->pending = !finished;
+				pending |= tile->pending;
+				if (tile->pending) {
+					if (pass == 0) {
+						visible_pending = true;
+						if (priority < 0) {
+							priority = tile_slot(tile);
+						}
+					} else {
+						preload_pending = true;
+					}
+				}
 			}
-			tile->pending = !finished;
-			pending |= tile->pending;
 		}
+	}
+	if (priority >= 0) {
+		coverloader_prioritize(priority);
 	}
 	if (pending) {
 		lv_timer_set_period(thumb_timer, ALBUM_GRID_POLL_MS);
@@ -2100,6 +2197,13 @@ static void thumb_timer_cb(lv_timer_t *timer) {
 
 static void window_update(panel_t *p) {
 	panel_refresh_stale(p);
+	unsigned revision = library_track_stats_revision();
+	bool stats_changed = p->is_tracks && p->stats_revision != revision;
+	if (stats_changed) {
+		p->stats_revision = revision;
+		p->window_first = -1;
+		p->window_count = 0;
+	}
 
 	if (p->grid) {
 		album_grid_update(p);
@@ -2138,6 +2242,13 @@ static void window_update(panel_t *p) {
 	// for the whole pool here is twelve string compares and makes the mark
 	// self-correcting whatever route the list took to get here.
 	panel_refresh_playmarks(p);
+	if (stats_changed) {
+		for (int i = 0; i < ROW_POOL; i++) {
+			row_t *row = &p->rows[i];
+			const char *path = NULL;
+			if (row_at(p, row->index, NULL, &path)) row_update_detail(p, row, row->index, path);
+		}
+	}
 
 	thumbs_update(p);
 }
@@ -2165,6 +2276,28 @@ static void rebind_all_panels(void) {
 		for (int r = 0; r < ROW_POOL; r++) {
 			p->rows[r].index = -1;
 		}
+		window_update(p);
+	}
+}
+
+bool medialist_show_play_counts(void) {
+	load_view_settings();
+	return show_play_counts;
+}
+
+void medialist_set_show_play_counts(bool on) {
+	load_view_settings();
+	if (show_play_counts == on) return;
+	show_play_counts = on;
+	config_set_bool("library", "show_play_counts", on);
+	config_save();
+	rebind_all_panels();
+}
+
+static void track_stats_tick(lv_timer_t *timer) {
+	(void)timer;
+	panel_t *p = &panel_tracks;
+	if (p->screen && lv_screen_active() == p->screen && p->stats_revision != library_track_stats_revision()) {
 		window_update(p);
 	}
 }
@@ -4121,7 +4254,19 @@ static void build_panel(panel_t *p, gui_config_t *cfg, bool is_tracks, int slot_
 		lv_obj_set_clickable(row->text, false);
 		lv_obj_set_event_bubble(row->text, true);
 
-		row->label = lv_label_create(row->text);
+		lv_obj_t *title_parent = row->text;
+		if (is_tracks) {
+			row->title_line = lv_obj_create(row->text);
+			lv_obj_remove_style_all(row->title_line);
+			lv_obj_set_size(row->title_line, lv_pct(100), LV_SIZE_CONTENT);
+			lv_obj_set_flex_flow(row->title_line, LV_FLEX_FLOW_ROW);
+			lv_obj_set_flex_align(row->title_line, LV_FLEX_ALIGN_START, LV_FLEX_ALIGN_CENTER, LV_FLEX_ALIGN_CENTER);
+			lv_obj_set_style_pad_column(row->title_line, 8, 0);
+			lv_obj_set_clickable(row->title_line, false);
+			lv_obj_set_scrollable(row->title_line, false);
+			title_parent = row->title_line;
+		}
+		row->label = lv_label_create(title_parent);
 		lv_label_set_long_mode(row->label, LV_LABEL_LONG_DOT);
 		lv_obj_set_width(row->label, LV_PCT(100));
 		// One line, always. LV_LABEL_LONG_DOT wraps before it truncates, and a
@@ -4129,6 +4274,17 @@ static void build_panel(panel_t *p, gui_config_t *cfg, bool is_tracks, int slot_
 		lv_obj_set_height(row->label, lv_font_get_line_height(&font_ui_24));
 		lv_obj_add_style(row->label, &theme_style_text, 0);
 		lv_obj_set_style_text_font(row->label, &font_ui_24, 0);
+		if (is_tracks) {
+			lv_obj_set_width(row->label, 0);
+			lv_obj_set_flex_grow(row->label, 1);
+			row->title_star = lv_image_create(row->title_line);
+			lv_image_set_src(row->title_star, &icon_star_filled);
+			lv_obj_set_size(row->title_star, 18, 18);
+			lv_image_set_inner_align(row->title_star, LV_IMAGE_ALIGN_CONTAIN);
+			lv_obj_set_style_image_recolor(row->title_star, lv_color_make(246, 211, 45), 0);
+			lv_obj_set_style_image_recolor_opa(row->title_star, LV_OPA_COVER, 0);
+			lv_obj_set_hidden(row->title_star, true);
+		}
 
 		row->detail = lv_obj_create(row->text);
 		lv_obj_remove_style_all(row->detail);
@@ -4167,6 +4323,21 @@ static void build_panel(panel_t *p, gui_config_t *cfg, bool is_tracks, int slot_
 		lv_obj_add_style(row->artist, &theme_style_text_dim, 0);
 		lv_obj_set_style_text_font(row->artist, &font_ui_20, 0);
 		lv_obj_set_hidden(row->artist, true);
+		if (is_tracks) {
+			row->detail_spacer = lv_obj_create(row->detail);
+			lv_obj_remove_style_all(row->detail_spacer);
+			lv_obj_set_size(row->detail_spacer, 0, 1);
+			lv_obj_set_flex_grow(row->detail_spacer, 1);
+			lv_obj_set_clickable(row->detail_spacer, false);
+			row->detail_star = lv_image_create(row->detail);
+			lv_image_set_src(row->detail_star, &icon_star_filled);
+			lv_obj_set_size(row->detail_star, 18, 18);
+			lv_image_set_inner_align(row->detail_star, LV_IMAGE_ALIGN_CONTAIN);
+			lv_obj_set_style_image_recolor(row->detail_star, lv_color_make(246, 211, 45), 0);
+			lv_obj_set_style_image_recolor_opa(row->detail_star, LV_OPA_COVER, 0);
+			lv_obj_set_style_image_opa(row->detail_star, LV_OPA_COVER, 0);
+			lv_obj_set_hidden(row->detail_star, true);
+		}
 
 		// Out of the flex layout on purpose: it sits in the row's own left
 		// padding, so adding it moves nothing. Hidden until a row it belongs
@@ -4483,6 +4654,11 @@ static void page_paint(panel_t *p) {
 		local_color(row->button, LV_STYLE_BG_COLOR, LV_STATE_PRESSED, t, p->tint_pressed);
 		local_color(row->label, LV_STYLE_TEXT_COLOR, 0, t, p->tint_ink);
 		local_color(row->artist, LV_STYLE_TEXT_COLOR, 0, t, p->tint_dim);
+		if (row->plays) {
+			local_color(row->plays, LV_STYLE_TEXT_COLOR, 0, t, p->tint_ink);
+			lv_obj_set_style_image_recolor(row->title_star, lv_color_make(246, 211, 45), 0);
+			lv_obj_set_style_image_recolor(row->detail_star, lv_color_make(246, 211, 45), 0);
+		}
 		local_color(row->playmark, LV_STYLE_BG_COLOR, 0, t, p->tint_ink);
 		if (row->menu_btn) {
 			local_color(lv_obj_get_child(row->menu_btn, 0), LV_STYLE_IMAGE_RECOLOR, 0, t, p->tint_ink);
@@ -4814,6 +4990,7 @@ static void head_show_image(panel_t *p, const cover_image_t *image) {
 	lv_obj_set_style_image_recolor_opa(p->head_cover, LV_OPA_TRANSP, 0);
 	lv_obj_set_style_bg_opa(p->head_cover, LV_OPA_TRANSP, 0);
 	lv_image_set_src(p->head_cover, &p->head_image.dsc);
+	album_art_fade_in(p->head_cover);
 	if (tint_from_cover(p)) {
 		p->tinted = true;
 		page_paint(p);
@@ -5487,6 +5664,7 @@ void medialist_init(gui_config_t *cfg) {
 	lv_obj_move_to_index(panel_artist_albums.album_btn, 0);
 
 	thumb_timer = lv_timer_create(thumb_timer_cb, THUMB_POLL_MS, NULL);
+	lv_timer_create(track_stats_tick, 1000, NULL);
 	lv_timer_pause(thumb_timer);
 
 	// The A-Z strip fades itself out; one timer serves all three panels.

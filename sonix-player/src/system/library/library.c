@@ -1,4 +1,5 @@
 #include "library.h"
+#include "listeningstats.h"
 
 #include "src/gui/nowplaying/cover.h"
 #include "src/system/audio/audio.h"
@@ -95,7 +96,14 @@ static const char *const SCHEMA[] = {
 	// from MEDIA_TABLE like the favourites, so a rescan does not forget it.
 	"CREATE TABLE IF NOT EXISTS PLAY_COUNTS(path TEXT PRIMARY KEY, plays INT NOT NULL, last_played INT)",
 
-	// Also local: every track the queue has played, one row each time, in the
+	// Listening time and qualifying plays from this firmware onward. Independent
+    // of the scan tables, so rescanning never discards listening statistics.
+    "CREATE TABLE IF NOT EXISTS LISTENING_DAYS(path TEXT, day TEXT, name TEXT, artist TEXT,"
+    " album TEXT, album_value TEXT, album_artist TEXT, seconds REAL NOT NULL DEFAULT 0, plays INT NOT NULL DEFAULT 0,"
+    " PRIMARY KEY(path,day))",
+    "CREATE INDEX IF NOT EXISTS listening_day_idx ON LISTENING_DAYS(day)",
+
+    // Also local: every track the queue has played, one row each time, in the
 	// order it happened (the queue page's History). The title and artist are
 	// written down with the row, so a rescan, or the file going, does not take
 	// the entry with it. `played_at` is 0 when the clock was not set.
@@ -306,6 +314,8 @@ static const char *const SORT_INDEXES[] = {
 #define SCAN_LOG_EVERY 200
 
 static sqlite3 *db;
+static unsigned stats_session = 1;
+static unsigned stats_revision = 1;
 static pthread_mutex_t db_lock = PTHREAD_MUTEX_INITIALIZER;
 
 // Bumped whenever a row's identity can have changed underneath a list that is
@@ -348,6 +358,7 @@ typedef enum {
 } gen_domain_t;
 
 static unsigned generation[GEN_COUNT] = {1, 1, 1};
+static unsigned track_stats_revision = 1;
 
 static gen_domain_t domain_of(library_list_t kind) {
 	switch (kind) {
@@ -361,9 +372,13 @@ static gen_domain_t domain_of(library_list_t kind) {
 }
 
 // Call with db_lock held, or from somewhere no query can be in flight.
-static void bump_generation(gen_domain_t domain) { generation[domain]++; }
+static void bump_generation(gen_domain_t domain) {
+	generation[domain]++;
+	track_stats_revision++;
+}
 
 static void bump_all_generations(void) {
+	track_stats_revision++;
 	for (int i = 0; i < GEN_COUNT; i++) {
 		generation[i]++;
 	}
@@ -372,6 +387,13 @@ static void bump_all_generations(void) {
 unsigned library_revision(library_list_t kind) {
 	pthread_mutex_lock(&db_lock);
 	unsigned value = generation[domain_of(kind)];
+	pthread_mutex_unlock(&db_lock);
+	return value;
+}
+
+unsigned library_track_stats_revision(void) {
+	pthread_mutex_lock(&db_lock);
+	unsigned value = track_stats_revision;
 	pthread_mutex_unlock(&db_lock);
 	return value;
 }
@@ -1544,6 +1566,7 @@ bool library_open(const char *db_path) {
 
 	pthread_mutex_lock(&db_lock);
 	links_check();
+    stats_session++;
 	bump_all_generations(); // a different card is a different set of row ids
 	pthread_mutex_unlock(&db_lock);
 
@@ -1586,6 +1609,7 @@ void library_close(void) {
 			fprintf(stderr, "library: sqlite3_close returned %d; the handle may be leaking\n", rc);
 		}
 		db = NULL;
+        stats_session++;
 		artist_links = album_artist_links = genre_links = false;
 		bump_all_generations(); // every open list is now looking at nothing
 	}
@@ -1601,7 +1625,7 @@ static bool playlist_table(const char *name, char *out, size_t out_size);
 static const char *const KEPT_TABLES[] = {
 	"FAVOURITES",			"PLAYBACK_STATE",		"PLAYBACK_QUEUE", "PLAYBACK_QUEUE_STATE",
 	"PLAYBACK_QUEUE_QUERY", "PLAYBACK_QUEUE_ALBUM", "PLAYLIST_MIGRATION",   "PLAY_COUNTS",
-	"PLAY_HISTORY",
+	"PLAY_HISTORY", "LISTENING_DAYS",
 };
 
 // Copies one table from the attached damaged file. A table the damage reaches
@@ -2360,6 +2384,8 @@ void library_note_play(const char *path) {
 			fprintf(stderr, "library: play of '%s' not counted: %s\n", path, sqlite3_errmsg(db));
 		} else if (sqlite3_changes(db) > 0) {
 			printf("library: play of '%s' counted\n", path);
+            stats_revision++;
+			track_stats_revision++;
 		}
 		sqlite3_finalize(stmt);
 	}
@@ -3237,9 +3263,30 @@ static int row_slot(const struct library_index *ix, int index) {
 	return ix->desc ? ix->count - 1 - index : index;
 }
 
+static const char *TRACK_STATS_SQL =
+	"SELECT COALESCE((SELECT plays FROM PLAY_COUNTS WHERE path=?1),0),"
+	" EXISTS(SELECT 1 FROM FAVOURITES WHERE path=?1)";
+
+void library_track_stats(const char *path, long long *plays, bool *favourite) {
+	*plays = 0;
+	*favourite = false;
+	if (!path || !path[0]) return;
+	pthread_mutex_lock(&db_lock);
+	sqlite3_stmt *stmt = NULL;
+	if (db && sqlite3_prepare_v2(db, TRACK_STATS_SQL, -1, &stmt, NULL) == SQLITE_OK) {
+		sqlite3_bind_text(stmt, 1, path, -1, SQLITE_TRANSIENT);
+		if (sqlite3_step(stmt) == SQLITE_ROW) {
+			*plays = sqlite3_column_int64(stmt, 0);
+			*favourite = sqlite3_column_int(stmt, 1) != 0;
+		}
+	}
+	sqlite3_finalize(stmt);
+	pthread_mutex_unlock(&db_lock);
+}
+
 static int index_window(const library_index_t *ix, int offset, int count, library_row_cb cb,
-						library_play_count_row_cb plays_cb, void *user) {
-	if (!ix || (!cb && !plays_cb) || offset < 0 || count <= 0 || offset >= ix->count) {
+						library_play_count_row_cb plays_cb, library_track_details_row_cb details_cb, void *user) {
+	if (!ix || (!cb && !plays_cb && !details_cb) || offset < 0 || count <= 0 || offset >= ix->count) {
 		return 0;
 	}
 	if (offset + count > ix->count) {
@@ -3263,6 +3310,10 @@ static int index_window(const library_index_t *ix, int offset, int count, librar
 
 	int delivered = 0;
 	sqlite3_stmt *stmt = NULL;
+	sqlite3_stmt *stats = NULL;
+	bool tracks = ix->kind == LIBRARY_LIST_TRACKS || ix->kind == LIBRARY_LIST_FAVOURITES ||
+		ix->kind == LIBRARY_LIST_PLAYLIST || ix->kind == LIBRARY_LIST_MOST_PLAYED;
+	if (db && tracks && details_cb) sqlite3_prepare_v2(db, TRACK_STATS_SQL, -1, &stats, NULL);
 	if (db && sqlite3_prepare_v2(db, sql, -1, &stmt, NULL) == SQLITE_OK) {
 		for (int i = 0; i < count; i++) {
 			sqlite3_reset(stmt);
@@ -3271,16 +3322,27 @@ static int index_window(const library_index_t *ix, int offset, int count, librar
 			// so the following rows stay in their original positions.
 			const char *name = NULL, *path = NULL, *artist = NULL;
 			long long plays = 0;
+			bool favourite = false;
 			if (sqlite3_step(stmt) == SQLITE_ROW) {
 				name = (const char *)sqlite3_column_text(stmt, 0);
 				path = (const char *)sqlite3_column_text(stmt, 1);
 				artist = (const char *)sqlite3_column_text(stmt, 2);
-				if (plays_cb && ix->kind == LIBRARY_LIST_MOST_PLAYED) {
+				if ((plays_cb || details_cb) && ix->kind == LIBRARY_LIST_MOST_PLAYED) {
 					plays = sqlite3_column_int64(stmt, 3);
 				}
+				if (stats && path) {
+					sqlite3_reset(stats);
+					sqlite3_bind_text(stats, 1, path, -1, SQLITE_TRANSIENT);
+					if (sqlite3_step(stats) == SQLITE_ROW) {
+						plays = sqlite3_column_int64(stats, 0);
+						favourite = sqlite3_column_int(stats, 1) != 0;
+					}
+				}
 			}
-			bool keep_going = plays_cb ? plays_cb(name ? name : "", path, artist, plays, user)
-									   : cb(name ? name : "", path, artist, user);
+			bool keep_going;
+			if (details_cb) keep_going = details_cb(name ? name : "", path, artist, plays, favourite, user);
+			else if (plays_cb) keep_going = plays_cb(name ? name : "", path, artist, plays, user);
+			else keep_going = cb(name ? name : "", path, artist, user);
 			if (!keep_going) {
 				break;
 			}
@@ -3288,18 +3350,24 @@ static int index_window(const library_index_t *ix, int offset, int count, librar
 		}
 		sqlite3_finalize(stmt);
 	}
+	sqlite3_finalize(stats);
 
 	pthread_mutex_unlock(&db_lock);
 	return delivered;
 }
 
 int library_index_window(const library_index_t *ix, int offset, int count, library_row_cb cb, void *user) {
-	return index_window(ix, offset, count, cb, NULL, user);
+	return index_window(ix, offset, count, cb, NULL, NULL, user);
 }
 
 int library_index_window_with_plays(const library_index_t *ix, int offset, int count,
 									library_play_count_row_cb cb, void *user) {
-	return index_window(ix, offset, count, NULL, cb, user);
+	return index_window(ix, offset, count, NULL, cb, NULL, user);
+}
+
+int library_index_window_with_details(const library_index_t *ix, int offset, int count,
+									 library_track_details_row_cb cb, void *user) {
+	return index_window(ix, offset, count, NULL, NULL, cb, user);
 }
 
 library_index_t *library_index_clone(const library_index_t *ix) {
@@ -8247,4 +8315,204 @@ int library_search(const char *query, int per_category, library_search_cb_t cb, 
 	}
 	pthread_mutex_unlock(&db_lock);
 	return total;
+}
+
+// ---------------------------------------------------------------------------
+// Listening statistics. The library mutex protects close/removal as well as
+// these statements. No SQLite handle escapes onto a worker or outlives a card.
+unsigned library_stats_session(void) {
+	pthread_mutex_lock(&db_lock);
+	unsigned value = stats_session;
+	pthread_mutex_unlock(&db_lock);
+	return value;
+}
+
+unsigned library_stats_revision(void) {
+	pthread_mutex_lock(&db_lock);
+	unsigned value = stats_revision + stats_session + generation[GEN_MEDIA];
+	pthread_mutex_unlock(&db_lock);
+	return value;
+}
+
+void library_stats_record(unsigned session, const char *path, const char *day, double seconds, int plays) {
+	if (!path || !path[0] || !day || (strlen(day) != 10 && day[0]) || seconds < 0 || plays < 0)
+		return;
+	if (seconds == 0 && plays == 0)
+		return;
+	pthread_mutex_lock(&db_lock);
+	sqlite3_stmt *stmt = NULL;
+	if (db && session == stats_session &&
+	    sqlite3_prepare_v2(
+	        db,
+	        "INSERT INTO LISTENING_DAYS(path,day,name,artist,album,album_value,album_artist,seconds,plays)"
+	        " SELECT "
+	        "?1,?2,name,artist,album,album||char(31)||COALESCE(album_key,''),COALESCE(NULLIF(album_artist,'')"
+	        ",artist),?3,?4"
+	        " FROM MEDIA_TABLE WHERE path=?1 LIMIT 1"
+	        " ON CONFLICT(path,day) DO UPDATE SET "
+	        "seconds=seconds+excluded.seconds,plays=plays+excluded.plays,"
+	        " name=excluded.name,artist=excluded.artist,album=excluded.album,album_value=excluded.album_"
+	        "value,album_artist=excluded.album_artist",
+	        -1, &stmt, NULL) == SQLITE_OK) {
+		sqlite3_bind_text(stmt, 1, path, -1, SQLITE_TRANSIENT);
+		sqlite3_bind_text(stmt, 2, day, -1, SQLITE_TRANSIENT);
+		sqlite3_bind_double(stmt, 3, seconds);
+		sqlite3_bind_int(stmt, 4, plays);
+		if (sqlite3_step(stmt) != SQLITE_DONE)
+			fprintf(stderr, "stats: could not save listening time: %s\n", sqlite3_errmsg(db));
+		else if (sqlite3_changes(db) > 0)
+			stats_revision++;
+	}
+	sqlite3_finalize(stmt);
+	pthread_mutex_unlock(&db_lock);
+}
+
+static void stats_day(struct tm *date, char out[11]) {
+	date->tm_isdst = -1;
+	mktime(date); // normalize across month/year and DST boundaries
+	strftime(out, 11, "%Y-%m-%d", date);
+}
+
+static void stats_dates(stats_period_t period, time_t now, listening_stats_t *out) {
+	struct tm date;
+	localtime_r(&now, &date);
+	date.tm_hour = 12;
+	date.tm_min = date.tm_sec = 0;
+	if (period == STATS_WEEK)
+		date.tm_mday -= (date.tm_wday + 6) % 7;
+	if (period == STATS_MONTH)
+		date.tm_mday = 1;
+	if (period == STATS_YEAR) {
+		date.tm_mon = 0;
+		date.tm_mday = 1;
+	}
+	if (period == STATS_ALL)
+		date.tm_mday -= 6;
+	char day[11];
+	stats_day(&date, day);
+	if (period != STATS_ALL)
+		snprintf(out->from, sizeof(out->from), "%s", day);
+	int month = date.tm_mon;
+	for (int i = 0; i < LISTENING_STATS_BUCKETS; i++) {
+		stats_day(&date, day);
+		if ((period == STATS_MONTH && date.tm_mon != month) || (period == STATS_YEAR && i == 12) ||
+		    ((period == STATS_WEEK || period == STATS_ALL) && i == 7))
+			break;
+		snprintf(out->bucket_keys[i], 11, "%s", day);
+		if (period == STATS_YEAR)
+			out->bucket_keys[i][7] = '\0';
+		out->bucket_count++;
+		if (period == STATS_YEAR)
+			date.tm_mon++;
+		else
+			date.tm_mday++;
+	}
+	stats_day(&date, day);
+	if (period != STATS_ALL)
+		snprintf(out->until, sizeof(out->until), "%s", day);
+}
+
+static void stats_bind(sqlite3_stmt *s, const listening_stats_t *out) {
+	sqlite3_bind_text(s, 1, out->from, -1, SQLITE_TRANSIENT);
+	sqlite3_bind_text(s, 2, out->until, -1, SQLITE_TRANSIENT);
+}
+static void stats_copy(sqlite3_stmt *s, int col, char *out, size_t size) {
+	const char *text = (const char *)sqlite3_column_text(s, col);
+	snprintf(out, size, "%s", text ? text : "");
+}
+
+void library_stats_read(stats_period_t period, time_t now, listening_stats_t *out) {
+	memset(out, 0, sizeof(*out));
+	if (period < STATS_WEEK || period > STATS_ALL)
+		period = STATS_WEEK;
+	out->period = period;
+	stats_dates(period, now, out);
+	pthread_mutex_lock(&db_lock);
+	out->session = stats_session;
+	if (!db) {
+		pthread_mutex_unlock(&db_lock);
+		return;
+	}
+	out->available = true;
+	sqlite3_stmt *s = NULL;
+	const char *where = "(?1='' OR (day>=?1 AND day<?2))";
+	char sql[4096];
+	snprintf(sql, sizeof(sql),
+	         "SELECT COALESCE(SUM(seconds),0),COALESCE(SUM(plays),0) FROM LISTENING_DAYS WHERE %s", where);
+	if (sqlite3_prepare_v2(db, sql, -1, &s, NULL) == SQLITE_OK) {
+		stats_bind(s, out);
+		if (sqlite3_step(s) == SQLITE_ROW) {
+			out->seconds = sqlite3_column_double(s, 0);
+			out->plays = sqlite3_column_int64(s, 1);
+		}
+	}
+	sqlite3_finalize(s);
+	s = NULL;
+	// All retains the existing lifetime counter; dated ranges deliberately do
+	// not invent dates for plays recorded before this feature was installed.
+	if (period == STATS_ALL &&
+	    sqlite3_prepare_v2(db, "SELECT COALESCE(SUM(plays),0) FROM PLAY_COUNTS", -1, &s, NULL) == SQLITE_OK) {
+		if (sqlite3_step(s) == SQLITE_ROW)
+			out->plays = sqlite3_column_int64(s, 0);
+	}
+	sqlite3_finalize(s);
+	s = NULL;
+	const char *bucket = period == STATS_YEAR ? "substr(day,1,7)" : "day";
+	snprintf(sql, sizeof(sql),
+	         "SELECT %s,SUM(seconds) FROM LISTENING_DAYS WHERE day>=?1 AND day<?2 GROUP BY 1", bucket);
+	if (sqlite3_prepare_v2(db, sql, -1, &s, NULL) == SQLITE_OK) {
+		sqlite3_bind_text(s, 1, out->bucket_keys[0], -1, SQLITE_TRANSIENT);
+		sqlite3_bind_text(s, 2, period == STATS_ALL ? "9999" : out->until, -1, SQLITE_TRANSIENT);
+		while (sqlite3_step(s) == SQLITE_ROW) {
+			const char *key = (const char *)sqlite3_column_text(s, 0);
+			for (int i = 0; i < out->bucket_count; i++)
+				if (key && !strcmp(key, out->bucket_keys[i]))
+					out->daily_seconds[i] = sqlite3_column_double(s, 1);
+		}
+	}
+	sqlite3_finalize(s);
+	s = NULL;
+	char source[2048];
+	if (period == STATS_ALL) {
+		snprintf(source, sizeof(source),
+		         "SELECT p.path,m.name,m.artist,m.album,m.album||char(31)||COALESCE(m.album_key,'') "
+		         "album_value,p.plays"
+		         " ,COALESCE(NULLIF(m.album_artist,''),m.artist) album_artist FROM PLAY_COUNTS p JOIN "
+		         "MEDIA_TABLE m ON m.rowid=(SELECT rowid FROM MEDIA_TABLE WHERE path=p.path LIMIT 1)");
+	} else {
+		snprintf(source, sizeof(source),
+		         "SELECT path,MAX(name) name,MAX(artist) artist,MAX(album) album,MAX(album_value) "
+		         "album_value,MAX(album_artist) album_artist,SUM(plays) plays"
+		         " FROM LISTENING_DAYS WHERE %s GROUP BY path",
+		         where);
+	}
+	for (int kind = 0; kind < STATS_KINDS; kind++) {
+		const char *artist = artist_links ? "COALESCE(l.artist,t.artist,'')" : "COALESCE(t.artist,'')";
+		const char *group = kind == STATS_ARTISTS  ? artist
+		                    : kind == STATS_ALBUMS ? "t.album_value"
+		                                           : "t.path";
+		const char *name = kind == STATS_ARTISTS ? artist : kind == STATS_ALBUMS ? "t.album" : "t.name";
+		snprintf(sql, sizeof(sql),
+		         "SELECT %s,%s,%s,MIN(t.path),SUM(t.plays),COUNT(DISTINCT t.path) FROM (%s) t %s"
+		         " WHERE t.plays>0 GROUP BY %s ORDER BY SUM(t.plays) DESC,1 COLLATE NOCASE LIMIT %d",
+		         name, kind == STATS_ALBUMS ? "MAX(t.album_artist)" : "MAX(t.artist)", group, source,
+		         (kind == STATS_ARTISTS && artist_links) ? "LEFT JOIN ARTIST_LINK l ON l.path=t.path" : "",
+		         group, LISTENING_STATS_TOP);
+		if (sqlite3_prepare_v2(db, sql, -1, &s, NULL) == SQLITE_OK) {
+			stats_bind(s, out);
+			while (sqlite3_step(s) == SQLITE_ROW && out->counts[kind] < LISTENING_STATS_TOP) {
+				stats_rank_t *r = &out->ranks[kind][out->counts[kind]++];
+				stats_copy(s, 0, r->title, sizeof(r->title));
+				stats_copy(s, 1, r->artist, sizeof(r->artist));
+				stats_copy(s, 2, r->value, sizeof(r->value));
+				stats_copy(s, 3, r->path, sizeof(r->path));
+				r->plays = sqlite3_column_int64(s, 4);
+				r->tracks = sqlite3_column_int(s, 5);
+			}
+		} else
+			fprintf(stderr, "stats: ranking query: %s\n", sqlite3_errmsg(db));
+		sqlite3_finalize(s);
+		s = NULL;
+	}
+	pthread_mutex_unlock(&db_lock);
 }

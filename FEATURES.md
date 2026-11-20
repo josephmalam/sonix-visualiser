@@ -22,6 +22,7 @@ This is everything Sonix Player can do today, on both the **R1** and the **R3 Pr
 
 > Scan the library from Settings > Music. You choose which folders of the card are scanned.
 
+- **Home Stats** - Listening time, qualifying plays and charts by week, month, year or all time, plus top artists, albums and tracks. Existing lifetime counts are retained; dated stats start with this firmware. Streaming is now under More.
 - **Main page** - All tracks, Albums, Artists, Album artists, Genres, Years, Favourites, Most played, Playlists and Browse. You can rearrange the tiles and hide the ones you don't use.
 - **Browse** - go through the folders of the card as they are.
 - **Search** across tracks, albums and artists.

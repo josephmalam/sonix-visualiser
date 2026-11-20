@@ -5331,6 +5331,9 @@ void player_init(gui_config_t *cfg) {
 	progress_slider = lv_slider_create(player_menu);
 	lv_obj_set_width(progress_slider, lv_pct(100));
 	lv_obj_set_height(progress_slider, PROGRESS_TRACK_HEIGHT);
+	// On the R1 this expands the normal hit band from 24 to 42 pixels,
+	// approximately 1.8 times its area, while keeping the drawn bar and knob.
+	lv_obj_set_ext_click_area(progress_slider, 16);
 	lv_slider_set_range(progress_slider, 0, 1000);
 
 	lv_obj_set_style_radius(progress_slider, LV_RADIUS_CIRCLE, LV_PART_MAIN);

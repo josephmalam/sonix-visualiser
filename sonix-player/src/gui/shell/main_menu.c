@@ -1,4 +1,6 @@
 #include "main_menu.h"
+#include "src/gui/library/statspage.h"
+#include "src/gui/library/stats_icon.h"
 
 #include <stdint.h>
 
@@ -22,7 +24,7 @@ void main_menu_init(gui_config_t *cfg) {
 	// say so on their own page.
 	const grid_entry_t entries[] = {
 		{"music", &icon_menu_music, &music_screen},
-		{"streaming", &icon_menu_streaming, &streaming_screen},
+		{"stats", &icon_menu_stats, &statspage_screen},
 		{"wireless", &icon_menu_wireless, &wireless_screen},
 		{"audiobooks", &icon_menu_audiobooks, &audiobooks_screen},
 		// The door to the More page, which holds the DAC and anything else

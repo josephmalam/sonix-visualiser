@@ -1095,6 +1095,7 @@ static lv_obj_t *library_screen;
 static lv_obj_t *album_view_switch;
 static lv_obj_t *album_head_switch;
 static lv_obj_t *quality_badges_switch;
+static lv_obj_t *play_counts_switch;
 static lv_obj_t *go_to_current_switch;
 
 static void folder_chain_cb(lv_event_t *e) {
@@ -1360,6 +1361,10 @@ static void quality_badges_cb(lv_event_t *e) {
 	medialist_set_quality_badges(lv_obj_has_state(lv_event_get_target(e), LV_STATE_CHECKED));
 }
 
+static void play_counts_cb(lv_event_t *e) {
+	medialist_set_show_play_counts(lv_obj_has_state(lv_event_get_target(e), LV_STATE_CHECKED));
+}
+
 // "Show artist": a switch, and under it one pill per list it can be shown on.
 // The pills are each on or off rather than one of three -- the artist can be
 // wanted on the albums and on all the tracks alike -- and at least one stays
@@ -1527,6 +1532,9 @@ static void build_library_page(gui_config_t *cfg) {
 	if (medialist_quality_badges()) {
 		lv_obj_add_state(quality_badges_switch, LV_STATE_CHECKED);
 	}
+	settingsrow_toggle(container, "musicsettings_play_counts", &play_counts_switch, play_counts_cb);
+	option_note(container, "musicsettings_play_counts_note");
+	if (medialist_show_play_counts()) lv_obj_add_state(play_counts_switch, LV_STATE_CHECKED);
 
 	// The library lists open on what is playing: the track in All tracks, what
 	// it belongs to in the others.

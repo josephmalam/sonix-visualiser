@@ -7,11 +7,14 @@
 
 #include "src/gui/fonts/fonts.h"
 #include "src/gui/nowplaying/player.h"
+#include "src/gui/nowplaying/coverloader.h"
 #include "src/gui/shell/corners.h"
 #include "src/gui/shell/icons.h"
 #include "src/gui/shell/switcher.h"
 #include "src/gui/shell/topbar.h"
 #include "src/system/core/lang.h"
+#include "src/system/library/library.h"
+#include "src/system/library/playlists.h"
 #include "src/system/device/power.h"
 #include "src/system/playback/device_state.h"
 #include "src/system/playback/playlist.h"
@@ -21,7 +24,7 @@
 #define WHEEL_SIZE 300
 #define WHEEL_HUB 104
 #define WHEEL_TAP_SLOP 12
-#define WHEEL_STEP_RADIANS .105f
+#define WHEEL_STEP_RADIANS .13125f
 #define PI 3.14159265359f
 #define VOLUME_SHOW_MS 1300
 #define DISPLAY_POLL_MS 200
@@ -45,11 +48,15 @@
 static lv_obj_t *screen, *wheel;
 static lv_obj_t *cover, *placeholder, *status_icon, *mode_icon, *battery_fill;
 static lv_obj_t *position, *title, *artist, *album, *elapsed, *remaining, *bar_fill;
+static lv_obj_t *lcd_heading, *now_content, *browse_content, *flow_content, *flow_image, *flow_caption, *flow_artist;
+static lv_obj_t *menu_rows[6], *menu_labels[6], *menu_arrows[6];
+static lv_timer_t *flow_timer;
 static lv_timer_t *display_timer;
 static int scale_w;
 static bool volume_shown;
 static uint32_t volume_at;
 static const lv_image_dsc_t *displayed_art;
+static char ipod_track[1024];
 static uint16_t sleeve_pixels[SLEEVE_SIZE * SLEEVE_IMAGE_H];
 static uint16_t shell_pixels[SHELL_MAX_EDGE * (2 * SHELL_MAX_EDGE + 3 * SHELL_TILE)];
 static lv_image_dsc_t shell_images[5];
@@ -213,10 +220,384 @@ static bool render_sleeve(const lv_image_dsc_t *art) {
 	return true;
 }
 
+#define MENU_ROWS 6
+#define MENU_ROW_H 52
+#define MENU_DEPTH 8
+#define FLOW_W 480
+#define FLOW_H 250
+#define FLOW_ART_SIZE 184
+#define FLOW_SIDE_COVERS (COVERLOADER_IPOD_COUNT / 2)
+
+typedef enum { IPOD_MAIN, IPOD_MUSIC, IPOD_LIBRARY, IPOD_PLAYLISTS, IPOD_NOW, IPOD_FLOW } ipod_page_t;
+
+typedef struct {
+	ipod_page_t page;
+	library_index_t *index;
+	library_list_t kind;
+	library_filter_t filter;
+	char value[256], heading[256];
+	int selected, top, count;
+	char **playlists;
+} ipod_menu_t;
+
+static ipod_menu_t menus[MENU_DEPTH];
+static int menu_depth;
+static bool menus_active;
+
+typedef struct {
+	int index;
+	bool pending;
+	cover_image_t art;
+} ipod_flow_card_t;
+
+static ipod_flow_card_t flow_cards[COVERLOADER_IPOD_COUNT];
+static uint16_t *flow_pixels;
+static lv_image_dsc_t flow_picture;
+static float flow_position;
+static bool flow_dirty;
+
+static void update_display(lv_timer_t *timer);
+static void menu_render(void);
+static void menu_select(void);
+
+static ipod_menu_t *current_menu(void) { return &menus[menu_depth]; }
+
+static void flow_clear(void) {
+	for (int i = 0; i < COVERLOADER_IPOD_COUNT; i++) {
+		coverloader_release(COVERLOADER_IPOD_BASE + i);
+		cover_free(&flow_cards[i].art);
+		flow_cards[i].index = -1;
+		flow_cards[i].pending = false;
+	}
+	if (flow_image) lv_image_set_src(flow_image, NULL);
+	free(flow_pixels);
+	flow_pixels = NULL;
+	if (flow_timer) lv_timer_pause(flow_timer);
+}
+
+static void menu_close(ipod_menu_t *menu) {
+	library_index_close(menu->index);
+	for (int i = 0; i < menu->count && menu->playlists; i++) free(menu->playlists[i]);
+	free(menu->playlists);
+	memset(menu, 0, sizeof(*menu));
+}
+
+static void menus_close(void) {
+	flow_clear();
+	for (int i = 0; i < MENU_DEPTH; i++) menu_close(&menus[i]);
+	menu_depth = 0;
+	menus_active = false;
+}
+
+typedef struct { char name[256], path[1024], artist[256]; bool found; } ipod_row_t;
+
+static bool menu_read_row(const char *name, const char *path, const char *artist_name, void *user) {
+	ipod_row_t *row = user;
+	snprintf(row->name, sizeof(row->name), "%s", name ? name : "");
+	snprintf(row->path, sizeof(row->path), "%s", path ? path : "");
+	snprintf(row->artist, sizeof(row->artist), "%s", artist_name ? artist_name : "");
+	row->found = true;
+	return false;
+}
+
+static bool menu_row(ipod_menu_t *menu, int index, ipod_row_t *row) {
+	memset(row, 0, sizeof(*row));
+	if (index < 0 || index >= menu->count) return false;
+	if (menu->page == IPOD_MAIN) {
+		static const char *const names[] = {"Music", "Now Playing", "Cover Flow"};
+		snprintf(row->name, sizeof(row->name), "%s", names[index]);
+	} else if (menu->page == IPOD_MUSIC) {
+		static const char *const names[] = {"Artists", "Albums", "Songs", "Genres", "Playlists"};
+		snprintf(row->name, sizeof(row->name), "%s", names[index]);
+	} else if (menu->page == IPOD_PLAYLISTS) {
+		snprintf(row->name, sizeof(row->name), "%s", menu->playlists[index]);
+	} else {
+		library_index_window(menu->index, index, 1, menu_read_row, row);
+		return row->found;
+	}
+	return true;
+}
+
+static bool menu_playlist_name(const char *name, void *user) {
+	ipod_menu_t *menu = user;
+	char *copy = strdup(name);
+	if (!copy) return false;
+	char **grown = realloc(menu->playlists, (size_t)(menu->count + 1) * sizeof(*grown));
+	if (!grown) {
+		free(copy);
+		return false;
+	}
+	menu->playlists = grown;
+	menu->playlists[menu->count++] = copy;
+	return true;
+}
+
+static void menu_reopen(ipod_menu_t *menu) {
+	library_index_close(menu->index);
+	menu->index = NULL;
+	if (library_is_open()) {
+		menu->index = library_index_open(menu->kind, menu->filter, menu->value[0] ? menu->value : NULL,
+										 LIBRARY_ORDER_DEFAULT, false);
+	}
+	menu->count = library_index_count(menu->index);
+	menu->selected = LV_CLAMP(0, menu->selected, LV_MAX(0, menu->count - 1));
+	menu->top = LV_MIN(menu->top, menu->selected);
+}
+
+static void menu_open(ipod_page_t page, const char *heading, library_list_t kind,
+					  library_filter_t filter, const char *value) {
+	if (menu_depth + 1 >= MENU_DEPTH) return;
+	if (current_menu()->page == IPOD_FLOW) flow_clear();
+	ipod_menu_t *menu = &menus[++menu_depth];
+	memset(menu, 0, sizeof(*menu));
+	menu->page = page;
+	menu->kind = kind;
+	menu->filter = filter;
+	snprintf(menu->heading, sizeof(menu->heading), "%s", heading);
+	snprintf(menu->value, sizeof(menu->value), "%s", value ? value : "");
+	if (page == IPOD_MUSIC) menu->count = 5;
+	if (page == IPOD_PLAYLISTS && library_is_open()) playlists_for_each(menu_playlist_name, menu);
+	if (page == IPOD_LIBRARY || page == IPOD_FLOW) menu_reopen(menu);
+	flow_position = menu->selected;
+	menu_render();
+}
+
+static void menu_back(void) {
+	if (!menu_depth) return;
+	if (current_menu()->page == IPOD_FLOW) flow_clear();
+	menu_close(current_menu());
+	menu_depth--;
+	flow_position = current_menu()->selected;
+	menu_render();
+}
+
+static void menu_move(int steps) {
+	ipod_menu_t *menu = current_menu();
+	menu->selected = LV_CLAMP(0, menu->selected + steps, LV_MAX(0, menu->count - 1));
+	if (menu->page == IPOD_FLOW) {
+		flow_dirty = true;
+		return;
+	}
+	menu_render();
+}
+
+static void menu_select(void) {
+	ipod_menu_t *menu = current_menu();
+	if (menu->index && library_index_stale(menu->index)) {
+		if (menu->page == IPOD_FLOW) flow_clear();
+		menu_reopen(menu);
+		flow_position = menu->selected;
+		menu_render();
+		return;
+	}
+	ipod_row_t row;
+	if (!menu_row(menu, menu->selected, &row)) return;
+	if (menu->page == IPOD_MAIN) {
+		switch (menu->selected) {
+		case 0: menu_open(IPOD_MUSIC, "Music", 0, 0, NULL); break;
+		case 1: menu_open(IPOD_NOW, "Now Playing", 0, 0, NULL); break;
+		case 2: menu_open(IPOD_FLOW, "Cover Flow", LIBRARY_LIST_ALBUMS, LIBRARY_FILTER_NONE, NULL); break;
+		}
+	} else if (menu->page == IPOD_MUSIC) {
+		static const library_list_t kinds[] = {LIBRARY_LIST_ARTISTS, LIBRARY_LIST_ALBUMS, LIBRARY_LIST_TRACKS,
+											   LIBRARY_LIST_GENRES};
+		if (menu->selected == 4) menu_open(IPOD_PLAYLISTS, row.name, 0, 0, NULL);
+		else menu_open(IPOD_LIBRARY, row.name, kinds[menu->selected], LIBRARY_FILTER_NONE, NULL);
+	} else if (menu->page == IPOD_PLAYLISTS) {
+		menu_open(IPOD_LIBRARY, row.name, LIBRARY_LIST_PLAYLIST, LIBRARY_FILTER_NONE, row.name);
+	} else if (menu->kind == LIBRARY_LIST_ALBUMS) {
+		char shown[256];
+		library_album_title(row.name, shown, sizeof(shown));
+		menu_open(IPOD_LIBRARY, shown, LIBRARY_LIST_TRACKS, LIBRARY_FILTER_ALBUM, row.name);
+	} else if (menu->kind == LIBRARY_LIST_ARTISTS || menu->kind == LIBRARY_LIST_GENRES) {
+		menu_open(IPOD_LIBRARY, row.name, LIBRARY_LIST_ALBUMS,
+				  menu->kind == LIBRARY_LIST_ARTISTS ? LIBRARY_FILTER_ARTIST : LIBRARY_FILTER_GENRE, row.name);
+	} else if (row.path[0] && device_state_play_index(library_index_clone(menu->index), menu->selected)) {
+		player_refresh_now_playing();
+		menu_open(IPOD_NOW, "Now Playing", 0, 0, NULL);
+	}
+}
+
+static void lcd_exit(lv_event_t *e) {
+	(void)e;
+	player_refresh_now_playing();
+	back_btn_cb(NULL);
+}
+
+// Render a fixed window of cached sleeves. Column heights form a perspective plane,
+// with a reflection attached to each column, as on the Now Playing sleeve.
+static void flow_draw_card(const cover_image_t *art, float offset) {
+	float tilt = fminf(1, fabsf(offset));
+	int w = (int)(184 - 88 * tilt);
+	int h = (int)(184 - 18 * tilt);
+	// Neighbours overlap the central sleeve and each other. Beyond the first
+	// neighbour the fan advances in narrower steps, continuing off both edges.
+	float distance = fabsf(offset);
+	float shift = 110 * fminf(1, distance) + 34 * fmaxf(0, distance - 1);
+	if (offset < 0) shift = -shift;
+	int left = (int)(FLOW_W / 2 + shift - w / 2);
+	const uint16_t *src = (const uint16_t *)art->pixels;
+	uint16_t paper = lv_color_to_u16(lv_color_hex(LCD_BG));
+	uint16_t blank = lv_color_to_u16(lv_color_hex(0xd9dcdd));
+	for (int x = 0; x < w; x++) {
+		int dx = left + x;
+		if (dx < 0 || dx >= FLOW_W) continue;
+		float across = (float)x / LV_MAX(1, w - 1);
+		float far = offset < 0 ? across : 1 - across;
+		float depth = 1 - .30f * tilt * far;
+		int column_h = (int)(h * depth);
+		int top = 14 + (184 - column_h) / 2;
+		float projection = across * (offset < 0 ? 1 - .30f * tilt : 1) / depth;
+		int source_x = src ? LV_MIN((int)(projection * (art->dsc.header.w - 1)),
+									art->dsc.header.w - 1) : 0;
+		for (int y = 0; y < column_h + 35; y++) {
+			int dy = top + y;
+			if (dy >= FLOW_H) break;
+			int sy = y < column_h ? y : 2 * column_h - 1 - y;
+			uint16_t ink = blank;
+			if (src) {
+				int source_y = LV_CLAMP(0, sy * art->dsc.header.h / column_h, art->dsc.header.h - 1);
+				ink = src[source_y * (art->dsc.header.stride / 2) + source_x];
+			}
+			if (y >= column_h) ink = lv_color_16_16_mix(ink, paper, 75 * (34 - (y - column_h)) / 34);
+			flow_pixels[dy * FLOW_W + dx] = ink;
+		}
+	}
+}
+
+static void flow_tick(lv_timer_t *timer) {
+	(void)timer;
+	if (!menus_active || current_menu()->page != IPOD_FLOW || !flow_pixels) return;
+	ipod_menu_t *menu = current_menu();
+	if (fabsf(flow_position - menu->selected) > .002f) {
+		flow_position += (menu->selected - flow_position) * .27f;
+		if (fabsf(flow_position - menu->selected) < .01f) flow_position = menu->selected;
+		flow_dirty = true;
+	}
+	int centre = (int)roundf(flow_position);
+	int first = LV_MAX(0, centre - FLOW_SIDE_COVERS), last = LV_MIN(menu->count, centre + FLOW_SIDE_COVERS + 1);
+	for (int i = 0; i < COVERLOADER_IPOD_COUNT; i++) {
+		ipod_flow_card_t *card = &flow_cards[i];
+		if (card->index >= first && card->index < last) continue;
+		coverloader_release(COVERLOADER_IPOD_BASE + i);
+		cover_free(&card->art);
+		card->index = -1;
+		card->pending = false;
+	}
+	// The centre gets first request and explicit worker priority.
+	for (int i = 0; i < COVERLOADER_IPOD_COUNT; i++) {
+		int offset = (i + 1) / 2;
+		if (i % 2) offset = -offset;
+		int index = centre + offset;
+		if (index < first || index >= last) continue;
+		int slot = index % COVERLOADER_IPOD_COUNT;
+		ipod_flow_card_t *card = &flow_cards[slot];
+		if (card->index != index) {
+			ipod_row_t row;
+			if (!menu_row(menu, index, &row)) continue;
+			card->index = index;
+			if (row.path[0]) {
+				coverloader_request(COVERLOADER_IPOD_BASE + slot, row.path, FLOW_ART_SIZE);
+				card->pending = true;
+			}
+			flow_dirty = true;
+		}
+		if (card->pending) {
+			bool finished = false;
+			if (coverloader_take(COVERLOADER_IPOD_BASE + slot, &card->art, &finished)) flow_dirty = true;
+			card->pending = !finished;
+			if (i == 0 && card->pending) coverloader_prioritize(COVERLOADER_IPOD_BASE + slot);
+		}
+	}
+	if (!flow_dirty) return;
+	flow_dirty = false;
+	uint16_t paper = lv_color_to_u16(lv_color_hex(LCD_BG));
+	for (int i = 0; i < FLOW_W * FLOW_H; i++) flow_pixels[i] = paper;
+	// Far sleeves first so the centre always draws on top.
+	for (int i = COVERLOADER_IPOD_COUNT - 1; i >= 0; i--) {
+		int offset = (i + 1) / 2;
+		if (i % 2) offset = -offset;
+		int index = centre + offset;
+		if (index < first || index >= last) continue;
+		ipod_flow_card_t *card = &flow_cards[index % COVERLOADER_IPOD_COUNT];
+		if (card->index == index) flow_draw_card(&card->art, index - flow_position);
+	}
+	ipod_row_t row;
+	char shown[256] = "";
+	if (menu_row(menu, menu->selected, &row)) library_album_title(row.name, shown, sizeof(shown));
+	set_label(flow_caption, menu->count ? shown : "No albums");
+	set_label(flow_artist, row.artist);
+	lv_obj_invalidate(flow_image);
+}
+
+static void menu_render(void) {
+	ipod_menu_t *menu = current_menu();
+	lv_obj_set_hidden(now_content, menu->page != IPOD_NOW);
+	lv_obj_set_hidden(browse_content, menu->page == IPOD_NOW || menu->page == IPOD_FLOW);
+	lv_obj_set_hidden(flow_content, menu->page != IPOD_FLOW);
+	set_label(lcd_heading, menu->heading);
+	if (menu->page == IPOD_NOW) {
+		lv_timer_pause(flow_timer);
+		update_display(NULL);
+		return;
+	}
+	if (menu->page == IPOD_FLOW) {
+		if (!flow_pixels) {
+			flow_pixels = malloc(FLOW_W * FLOW_H * sizeof(*flow_pixels));
+			if (!flow_pixels) {
+				menu_back();
+				gui_notify_popup("Not enough memory for Cover Flow");
+				return;
+			}
+			flow_picture = (lv_image_dsc_t){
+				.header = {.magic=LV_IMAGE_HEADER_MAGIC, .cf=LV_COLOR_FORMAT_RGB565,
+						   .w=FLOW_W, .h=FLOW_H, .stride=FLOW_W*2},
+				.data_size=FLOW_W*FLOW_H*2, .data=(const uint8_t *)flow_pixels
+			};
+			lv_image_set_src(flow_image, &flow_picture);
+		}
+		flow_dirty = true;
+		flow_tick(NULL);
+		lv_timer_resume(flow_timer);
+		return;
+	}
+	lv_timer_pause(flow_timer);
+	if (menu->selected < menu->top) menu->top = menu->selected;
+	if (menu->selected >= menu->top + MENU_ROWS) menu->top = menu->selected - MENU_ROWS + 1;
+	for (int i = 0; i < MENU_ROWS; i++) {
+		ipod_row_t row;
+		int index = menu->top + i;
+		bool exists = menu_row(menu, index, &row);
+		lv_obj_set_hidden(menu_rows[i], !exists && (i > 0 || menu->count > 0));
+		bool selected = exists && index == menu->selected;
+		lv_obj_set_style_bg_color(menu_rows[i], lv_color_hex(selected ? 0x2489d3 : LCD_BG), 0);
+		lv_obj_set_style_bg_grad_color(menu_rows[i], lv_color_hex(selected ? 0x1365b4 : LCD_BG), 0);
+		lv_obj_set_style_text_color(menu_labels[i], selected ? lv_color_white() : lv_color_hex(LCD_INK), 0);
+		lv_obj_set_style_image_recolor(menu_arrows[i], selected ? lv_color_white() : lv_color_hex(LCD_INK), 0);
+		char shown[256];
+		library_album_title(row.name, shown, sizeof(shown));
+		lv_label_set_text(menu_labels[i], exists ? shown : library_is_open() ? "No items" : "Insert microSD card");
+	}
+}
+
 static void update_display(lv_timer_t *timer) {
 	(void)timer;
+	if (menus_active) {
+		ipod_menu_t *menu = current_menu();
+		if ((menu->page == IPOD_LIBRARY || menu->page == IPOD_FLOW) &&
+			(library_index_stale(menu->index) || (!menu->index && library_is_open()))) {
+			if (menu->page == IPOD_FLOW) flow_clear();
+			menu_reopen(menu);
+			flow_position = menu->selected;
+			menu_render();
+		}
+	}
 	device_state_t state;
 	device_state_get(&state);
+	if (strcmp(ipod_track, state.current_file) != 0) {
+		snprintf(ipod_track, sizeof(ipod_track), "%s", state.current_file);
+		player_refresh_now_playing();
+	}
 	const char *track = state.metadata.title;
 	if (!track[0] && state.current_file[0]) {
 		const char *slash = strrchr(state.current_file, '/');
@@ -284,7 +665,7 @@ static void update_display(lv_timer_t *timer) {
 	lv_obj_set_hidden(bar_fill, fill == 0);
 }
 
-typedef enum { WHEEL_NONE, WHEEL_MENU, WHEEL_PREV, WHEEL_NEXT, WHEEL_PLAY_PAUSE } wheel_action_t;
+typedef enum { WHEEL_NONE, WHEEL_MENU, WHEEL_PREV, WHEEL_NEXT, WHEEL_PLAY_PAUSE, WHEEL_SELECT } wheel_action_t;
 
 static bool in_ring(int x, int y) {
 	int distance = x * x + y * y;
@@ -293,6 +674,8 @@ static bool in_ring(int x, int y) {
 }
 
 static wheel_action_t wheel_action(int x, int y) {
+	int inner = scale(WHEEL_HUB / 2);
+	if (x * x + y * y < inner * inner) return WHEEL_SELECT;
 	if (!in_ring(x, y)) return WHEEL_NONE;
 	if (abs(x) > abs(y)) return x < 0 ? WHEEL_PREV : WHEEL_NEXT;
 	return y < 0 ? WHEEL_MENU : WHEEL_PLAY_PAUSE;
@@ -332,12 +715,17 @@ static void wheel_event(lv_event_t *e) {
 	bool ring = in_ring(p.x, p.y);
 
 	if (code == LV_EVENT_PRESSED) {
-		touch.active = touch.have_angle = ring;
+		touch.active = wheel_action(p.x, p.y) != WHEEL_NONE;
+		touch.have_angle = ring;
 		touch.moved = false;
 		touch.start = p;
 		touch.angle = ring ? atan2f(p.y, p.x) : 0;
 		touch.travel = 0;
 	} else if (touch.active && code == LV_EVENT_PRESSING) {
+		if (wheel_action(touch.start.x, touch.start.y) == WHEEL_SELECT) {
+			if (moved_from_start(p)) touch.moved = true;
+			return;
+		}
 		if (!ring) {
 			// Lifting off the ring and re-entering must never jump the volume.
 			touch.have_angle = false;
@@ -352,18 +740,26 @@ static void wheel_event(lv_event_t *e) {
 		touch.angle = angle;
 		touch.have_angle = true;
 		if (steps) {
-			device_state_change_volume_percent(steps);
-			topbar_refresh_volume(device_state_get_volume_percent());
-			volume_at = lv_tick_get();
-			volume_shown = true;
-			update_display(NULL);
+			if (current_menu()->page == IPOD_NOW) {
+				device_state_change_volume_percent(steps);
+				topbar_refresh_volume(device_state_get_volume_percent());
+				volume_at = lv_tick_get();
+				volume_shown = true;
+				update_display(NULL);
+			} else {
+				menu_move(steps);
+			}
 		}
 	} else if (touch.active && code == LV_EVENT_RELEASED) {
 		touch.active = false;
 		wheel_action_t action = wheel_action(p.x, p.y);
 		if (touch.moved || moved_from_start(p) || action != wheel_action(touch.start.x, touch.start.y)) return;
 		switch (action) {
-		case WHEEL_MENU: back_btn_cb(NULL); return;
+		case WHEEL_MENU: menu_back(); return;
+		case WHEEL_SELECT:
+			if (current_menu()->page == IPOD_NOW) player_screen_play_pause();
+			else menu_select();
+			break;
 		case WHEEL_PREV: player_screen_prev(); break;
 		case WHEEL_NEXT: player_screen_next(); break;
 		case WHEEL_PLAY_PAUSE: player_screen_play_pause(); break;
@@ -388,14 +784,16 @@ static void build_lcd(void) {
 	lv_obj_t *lcd = panel(screen, LCD_BG);
 	lv_obj_set_size(lcd, lv_pct(100), scale(LCD_H));
 	lv_obj_t *header = panel(lcd, 0xf2f4f5);
+	lv_obj_set_clickable(header, true);
+	lv_obj_add_event_cb(header, lcd_exit, LV_EVENT_CLICKED, NULL);
 	lv_obj_set_size(header, lv_pct(100), scale(LCD_HEADER_H));
 	gradient_to(header, LV_GRAD_DIR_VER, 0xa8afb1);
 	lv_obj_t *rule = panel(header, 0x81827b);
 	lv_obj_set_size(rule, lv_pct(100), 1);
 	lv_obj_align(rule, LV_ALIGN_BOTTOM_MID, 0, 0);
 
-	lv_obj_t *heading = lcd_label(header, 14, 4, 350, &font_ui_20_bold, LV_TEXT_ALIGN_LEFT);
-	lv_label_set_text(heading, tr("musicsettings_now_playing"));
+	lcd_heading = lcd_label(header, 14, 4, 350, &font_ui_20_bold, LV_TEXT_ALIGN_LEFT);
+	lv_label_set_text(lcd_heading, "iPod");
 	status_icon = glyph(header, &icon_pause, 16, 0x217c9d);
 	lv_obj_align(status_icon, LV_ALIGN_TOP_RIGHT, -scale(45), scale(9));
 	lv_obj_t *battery = panel(header, 0x9da596);
@@ -411,6 +809,7 @@ static void build_lcd(void) {
 	place(battery_fill, 1, 1, 24, 11);
 
 	lv_obj_t *content = panel(lcd, LCD_BG);
+	now_content = content;
 	lv_obj_set_size(content, scale_w, scale(LCD_H - LCD_HEADER_H));
 	lv_obj_align(content, LV_ALIGN_TOP_MID, 0, scale(LCD_HEADER_H));
 	mode_icon = glyph(content, NULL, 21, LCD_INK);
@@ -440,6 +839,32 @@ static void build_lcd(void) {
 	lv_obj_set_hidden(bar_fill, true);
 	elapsed = lcd_label(content, 13, 274, 70, &font_ui_18, LV_TEXT_ALIGN_LEFT);
 	remaining = lcd_label(content, 395, 274, 70, &font_ui_18, LV_TEXT_ALIGN_RIGHT);
+
+	browse_content = panel(lcd, LCD_BG);
+	place(browse_content, 0, LCD_HEADER_H, DESIGN_W, LCD_H - LCD_HEADER_H);
+	for (int i = 0; i < MENU_ROWS; i++) {
+		menu_rows[i] = panel(browse_content, LCD_BG);
+		place(menu_rows[i], 0, i * MENU_ROW_H, DESIGN_W, MENU_ROW_H);
+		gradient_to(menu_rows[i], LV_GRAD_DIR_VER, LCD_BG);
+		menu_labels[i] = lcd_label(menu_rows[i], 16, 12, 422, &font_ui_24_bold, LV_TEXT_ALIGN_LEFT);
+		menu_arrows[i] = glyph(menu_rows[i], &icon_chevron_right, 18, LCD_INK);
+		lv_obj_align(menu_arrows[i], LV_ALIGN_RIGHT_MID, -scale(14), 0);
+	}
+	flow_content = panel(lcd, LCD_BG);
+	place(flow_content, 0, LCD_HEADER_H, DESIGN_W, LCD_H - LCD_HEADER_H);
+	flow_image = lv_image_create(flow_content);
+	place(flow_image, 0, 0, FLOW_W, FLOW_H);
+	lv_image_set_inner_align(flow_image, LV_IMAGE_ALIGN_STRETCH);
+	flow_caption = lcd_label(flow_content, 18, 256, 444, &font_ui_20_bold, LV_TEXT_ALIGN_CENTER);
+	flow_artist = lcd_label(flow_content, 18, 284, 444, &font_ui_18, LV_TEXT_ALIGN_CENTER);
+	lv_obj_set_hidden(flow_content, true);
+
+	// The LCD is a display and an exit target. Navigation belongs to the wheel.
+	lv_obj_t *exit_target = panel(lcd, LCD_BG);
+	lv_obj_set_size(exit_target, lv_pct(100), lv_pct(100));
+	lv_obj_set_style_bg_opa(exit_target, LV_OPA_TRANSP, 0);
+	lv_obj_set_clickable(exit_target, true);
+	lv_obj_add_event_cb(exit_target, lcd_exit, LV_EVENT_CLICKED, NULL);
 }
 
 static uint16_t shell_shade(uint16_t ink, int distance, int bevel, int x, int y) {
@@ -566,6 +991,7 @@ static void unloaded(lv_event_t *e) {
 	touch.active = false;
 	volume_shown = false;
 	lv_timer_pause(display_timer);
+	menus_close();
 	ipod_mode_release_artwork();
 	corners_set_suppressed(false);
 	back_btn_hide_on_screen(screen, false);
@@ -581,12 +1007,22 @@ void ipod_mode_open(gui_config_t *cfg) {
 		build_lcd();
 		build_lower_shell(cfg);
 		build_wheel();
+		flow_timer = lv_timer_create(flow_tick, 33, NULL);
+		power_pause_in_standby(flow_timer);
+		lv_timer_pause(flow_timer);
 		display_timer = lv_timer_create(update_display, DISPLAY_POLL_MS, NULL);
 		power_pause_in_standby(display_timer);
 		lv_timer_pause(display_timer);
 		lv_obj_add_event_cb(screen, loaded, LV_EVENT_SCREEN_LOADED, NULL);
 		lv_obj_add_event_cb(screen, unloaded, LV_EVENT_SCREEN_UNLOADED, NULL);
 	}
+	if (lv_screen_active() == screen) return;
+	menus_close();
+	menus_active = true;
+	menus[0].page = IPOD_MAIN;
+	menus[0].count = 3;
+	snprintf(menus[0].heading, sizeof(menus[0].heading), "iPod");
+	menu_render();
 	player_sheet_close(false);
 	back_btn_hide_on_screen(screen, true);
 	switch_screen(screen);

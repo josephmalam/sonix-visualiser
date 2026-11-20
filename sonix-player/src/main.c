@@ -1,3 +1,4 @@
+#include "src/system/library/playcount.h"
 #include "lvgl/lvgl.h"
 
 #include <dirent.h>
@@ -2403,6 +2404,7 @@ int main(int argc, char **argv) {
 		}
 	}
 
+    playcount_flush();
 	library_close();
 	printf("\n");
 

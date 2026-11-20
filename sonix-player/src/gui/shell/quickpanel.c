@@ -2149,6 +2149,11 @@ void quickpanel_init(gui_config_t *cfg) {
 	lv_obj_set_style_pad_gap(bright_row, 18, 0);
 	lv_obj_set_scrollable(bright_row, false);
 	lv_obj_set_event_bubble(bright_row, true);
+	// Let the slider's larger hit area extend beyond this 44px layout row.
+	// Keep its layout and drawn size unchanged.
+	lv_obj_set_overflow_visible(bright_row, true);
+	lv_obj_set_ext_draw_size(bright_row, 18);
+	lv_obj_refresh_ext_draw_size(bright_row);
 	lv_obj_set_flex_flow(bright_row, LV_FLEX_FLOW_ROW);
 	lv_obj_set_flex_align(bright_row, LV_FLEX_ALIGN_START, LV_FLEX_ALIGN_CENTER, LV_FLEX_ALIGN_CENTER);
 
@@ -2173,7 +2178,8 @@ void quickpanel_init(gui_config_t *cfg) {
 	lv_obj_set_style_shadow_width(brightness_slider, 8, LV_PART_KNOB);
 	lv_obj_set_style_shadow_opa(brightness_slider, LV_OPA_30, LV_PART_KNOB);
 	lv_obj_set_style_shadow_color(brightness_slider, lv_color_black(), LV_PART_KNOB);
-	lv_obj_set_ext_click_area(brightness_slider, 18);
+	// An 80px hit band, about 1.8x the previously reachable 44px row.
+	lv_obj_set_ext_click_area(brightness_slider, 35);
 	lv_obj_add_event_cb(brightness_slider, brightness_changed_cb, LV_EVENT_VALUE_CHANGED, NULL);
 	lv_obj_add_event_cb(brightness_slider, brightness_released_cb, LV_EVENT_RELEASED, NULL);
 

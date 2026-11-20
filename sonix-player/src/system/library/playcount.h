@@ -19,10 +19,13 @@ typedef struct {
 	const char *file; // the loaded file, "" for none
 	double position;  // seconds
 	double duration;  // seconds, 0 when unknown
-	bool skip;		  // a station, an audiobook or a podcast: never counted
+	bool skip;        // a station, an audiobook or a podcast: never counted
 } playcount_playback_t;
 
 // GUI thread, about once a second, with what is playing now.
 void playcount_note_playback(const playcount_playback_t *now);
+
+// Flush pending daily statistics before orderly shutdown or SD export.
+void playcount_flush(void);
 
 #endif // PLAYCOUNT_H

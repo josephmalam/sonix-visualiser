@@ -60,6 +60,8 @@ void medialist_set_allow_delete(bool on);
 // hi-res or DSD -- under its title. Off by default.
 bool medialist_quality_badges(void);
 void medialist_set_quality_badges(bool on);
+bool medialist_show_play_counts(void);
+void medialist_set_show_play_counts(bool on);
 
 // "Show artist": the artist under the title of each row, on the lists `lists`
 // picks out -- all the tracks, the albums, a genre's albums and tracks, the

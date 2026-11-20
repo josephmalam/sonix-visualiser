@@ -1,3 +1,4 @@
+#include "src/system/library/playcount.h"
 #include "system.h"
 
 #include <dirent.h>
@@ -798,6 +799,7 @@ static void card_databases_detach(void) {
 	if (!card_attached) {
 		return;
 	}
+	playcount_flush();
 	card_attached = false;
 
 	// Playback first. The playback thread keeps the track's descriptor open for

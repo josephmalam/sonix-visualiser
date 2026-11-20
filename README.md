@@ -2,6 +2,9 @@
 Changes in this fork were vibe coded with Codex. I've tested on my HiBy R1 but I'm not responsible if anything here breaks your device in any way.
 
 ## Changes in this Fork
+- Added a Stats home tile with listening time, charts and top artists, albums and tracks by week, month, year or all time; Streaming is now under More
+- Play counts can be shown throughout library track lists, with a yellow favourites indicator
+- Larger invisible touch targets for the Now Playing progress and Control Centre brightness sliders
 - Added a classic 'iTunes visualiser' mode
 - Improved thumbnail loading times with some caching and pre-generation changes
 - CoverFlow artwork now loads instantly and I added fade-in-out so it looks smoother when scrolling
@@ -10,7 +13,7 @@ Changes in this fork were vibe coded with Codex. I've tested on my HiBy R1 but I
 - Tapping the artist name from Now Playing jumps to their album list / discography
 - Most played lists the number of plays for each track
 - Swiping from the cover to the lyrics fades the background (reflection). The way it just popped previously was annoying
-- Added iPod mode (access from lower right menu in now playing), just for fun
+- Added iPod mode (access from lower right menu in now playing), with wheel-controlled music menus and Cover Flow; tap the iPod screen to exit
  
  ------
  
@@ -35,6 +38,13 @@ Use the **From SD card** update route for these builds. The **Via internet**
 option in this build still checks the upstream Sonix Player releases. The
 features were exercised in the Linux simulator and the image was checked for
 the R1. Only the R1 firmware image is provided here.
+
+Stats keeps existing lifetime play counts under All. Dated listening statistics
+and listening time accumulate from the firmware that introduced Stats onward.
+Its artwork uses a small shared thumbnail cache with a quick fade, and its
+ranked lists keep a fixed number of rows in memory. The
+[Stats design and test procedure](sonix-player/tools/listening-stats-test.md)
+describes the behaviour and repeatable checks.
 
 For source builds, follow the upstream build and packing instructions below.
 The [Cover Flow cache procedure](sonix-player/tools/coverflow-cache-test.md)

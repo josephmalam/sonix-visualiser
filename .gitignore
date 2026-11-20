@@ -1,4 +1,5 @@
 .DS_Store
+.sonix-build/
 
 sonix-player/sonix_player
 sonix-player/sonix_player_debug

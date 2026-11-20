@@ -564,6 +564,13 @@ typedef bool (*library_play_count_row_cb)(const char *name, const char *path, co
 int library_index_window_with_plays(const library_index_t *ix, int offset, int count,
 									library_play_count_row_cb cb, void *user);
 
+typedef bool (*library_track_details_row_cb)(const char *name, const char *path, const char *artist,
+										   long long plays, bool favourite, void *user);
+int library_index_window_with_details(const library_index_t *ix, int offset, int count,
+									 library_track_details_row_cb cb, void *user);
+void library_track_stats(const char *path, long long *plays, bool *favourite);
+unsigned library_track_stats_revision(void);
+
 // A second handle over the same rows, without asking the database for the
 // sort again: the row ids are simply copied. What the playback queue is given
 // when a list is started, so the queue does not have to be a second copy of the

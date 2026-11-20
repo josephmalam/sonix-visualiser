@@ -1,4 +1,5 @@
 #include "gui.h"
+#include "src/gui/library/statspage.h"
 
 #include <pthread.h>
 #include <stdint.h>
@@ -595,6 +596,8 @@ void gui_init(gui_config_t *cfg) {
 	lv_obj_set_scrollbar_mode(lv_layer_top(), LV_SCROLLBAR_MODE_OFF);
 
 	main_menu_screen = lv_obj_create(NULL);
+    statspage_screen=lv_obj_create(NULL);
+    statslist_screen=lv_obj_create(NULL);
 	music_screen = lv_obj_create(NULL);
 	player_screen = lv_obj_create(lv_layer_top()); // a sheet, not a page: see player.h
 	browser_screen = lv_obj_create(NULL);
@@ -660,6 +663,7 @@ void gui_init(gui_config_t *cfg) {
 	corners_init(cfg);
 
 	main_menu_init(cfg);
+    statspage_init(cfg);
 
 	music_init(cfg);
 	coverflow_init(cfg);
@@ -747,7 +751,7 @@ void gui_init(gui_config_t *cfg) {
 		// only way out of it.
 		medialist_tracks_screen, medialist_albums_screen, audiobooks_screen, wireless_screen,
 		streaming_screen,		 radiopage_screen,	radiolist_screen,	radiosearch_screen,
-		morepage_screen,
+		morepage_screen, statspage_screen, statslist_screen,
 	};
 	for (size_t i = 0; i < sizeof(player_swipe_screens) / sizeof(player_swipe_screens[0]); i++) {
 		player_sheet_attach_drag(player_swipe_screens[i], true);
@@ -758,7 +762,7 @@ void gui_init(gui_config_t *cfg) {
 	// exits are their own buttons -- and the handler itself skips the main
 	// menu.
 	lv_obj_t *const back_swipe_screens[] = {
-		main_menu_screen, music_screen,			browser_screen,	  settings_screen,
+		main_menu_screen, statspage_screen, statslist_screen, music_screen,			browser_screen,	  settings_screen,
 		devoptions_screen, processespage_screen, musicsettings_screen, powersettings_screen, appearance_screen,
 		language_screen,
 		medialist_screen,  medialist_tracks_screen, medialist_albums_screen, audiobooks_screen, audiobooksettings_screen,

@@ -78,12 +78,13 @@ typedef struct {
 	const char *label;
 	const char *key;
 	int minimum;
+	int maximum;
 	int percent;
 	lv_obj_t *value;
 } visualiser_tuning_t;
 
-static visualiser_tuning_t motion_speed = {"Motion speed", "speed", 50, 100, NULL};
-static visualiser_tuning_t music_response = {"Music response", "response", 0, 100, NULL};
+static visualiser_tuning_t motion_speed = {"Motion speed", "speed", 50, 150, 100, NULL};
+static visualiser_tuning_t music_response = {"Music response", "response", 0, 200, 100, NULL};
 static bool settings_dirty;
 
 // A table keeps trigonometry out of the inner drawing loop on the R1. Angles
@@ -180,7 +181,9 @@ static void advance_motion(float elapsed) {
 	beat *= 125.0f / (125.0f + elapsed);
 
 	float step = elapsed / FRAME_MS * (motion_speed.percent * .01f);
-	phase += (.0026f + .0045f * mid + .0030f * pulse) * step;
+	// Keep the overall rotation gentle while bends and forward travel retain
+	// their pace and music response.
+	phase += (.00075f + .0011f * mid + .00075f * pulse) * step;
 	drift += (.0012f + .0011f * bass) * step;
 	twist += (.0019f + .0014f * treble) * step;
 	shape_phase += (.0032f + .0013f * mid) * step;
@@ -198,9 +201,20 @@ static unsigned rgb565(unsigned r, unsigned g, unsigned b) {
 	return (r << 11) | (g << 5) | b;
 }
 
+static float palette_hue(float tone) {
+	// Give red, orange, yellow, green, blue, purple and pink equal time.
+	// A linear HSV sweep otherwise gives the broad green/cyan region much
+	// more time than orange and pink, and green is brighter to the eye.
+	static const float hues[] = {0, 30, 60, 120, 240, 275, 325, 360};
+	tone -= floorf(tone);
+	float position = tone * 7;
+	int segment = (int)position;
+	return hues[segment] + (hues[segment + 1] - hues[segment]) * (position - segment);
+}
+
 static uint16_t filament_color(float tone, float saturation, float level) {
 	tone -= floorf(tone);
-	lv_color_t rgb = lv_color_hsv_to_rgb((uint16_t)(tone * 360), (uint8_t)(saturation * 100),
+	lv_color_t rgb = lv_color_hsv_to_rgb((uint16_t)palette_hue(tone), (uint8_t)(saturation * 100),
 										 (uint8_t)(level * 100));
 	return lv_color_to_u16(rgb);
 }
@@ -322,11 +336,13 @@ static void draw_tunnel(void) {
 	// the viewer. Both ends fade so recycling a section never flashes.
 	for (int i = TUNNEL_RINGS; i > 0; i--) {
 		float depth = i - tunnel_travel;
-		float distance = .68f / (.50f + depth);
+		// Depth decreases as we move forward. Nearby sections expand beyond
+		// the edges, with a shared vanishing point for the distant sections.
+		float distance = .68f / (.30f + depth);
 		float fade = fminf(1, fminf(depth * 3.4f, (TUNNEL_RINGS - depth) * 1.6f));
-		float turn = phase + .10f * wave(twist) - .085f * depth;
-		int offset_x = (int)(reach * SUBPIXEL * .105f * wave(drift + depth * .12f));
-		int offset_y = (int)(reach * SUBPIXEL * .076f * wave(drift + depth * .09f + .25f));
+		float turn = phase + .04f * wave(twist) - .02f * depth;
+		int offset_x = (int)(reach * SUBPIXEL * distance * .105f * wave(drift));
+		int offset_y = (int)(reach * SUBPIXEL * distance * .076f * wave(drift + .25f));
 		uint16_t ink[3];
 		for (int j = 0; j < 3; j++) {
 			float level = fade * (.17f + .06f * bass) * (.58f + .21f * j);
@@ -568,11 +584,11 @@ static void add_layer_toggle(lv_obj_t *panel, visualiser_layer_t *layer) {
 
 static void add_tuning_slider(lv_obj_t *panel, visualiser_tuning_t *tuning) {
 	lv_obj_t *slider;
-	int steps = (150 - tuning->minimum) / TUNING_STEP + 1;
+	int steps = (tuning->maximum - tuning->minimum) / TUNING_STEP + 1;
 	settingsrow_slider(panel, tuning->label, steps, &tuning->value, &slider, NULL);
 	long saved = config_get_int("visualiser", tuning->key, 100);
 	int index = 0;
-	if (saved >= 150) {
+	if (saved >= tuning->maximum) {
 		index = steps - 1;
 	} else if (saved > tuning->minimum) {
 		index = (int)(saved - tuning->minimum) / TUNING_STEP;
