@@ -959,6 +959,10 @@ static void albumkey_sql(sqlite3_context *ctx, int argc, sqlite3_value **argv) {
 	"(SELECT " columns " FROM MEDIA_TABLE m WHERE m.album = g.album AND m.album_key = g.album_key" \
 	" ORDER BY COALESCE(m.disc,1), m.dis_id LIMIT 1)"
 
+#define ALBUM_GROUP_ARTIST ALBUM_GROUP_FIRST("COALESCE(NULLIF(m.album_artist,''), m.artist)")
+#define ALBUM_GROUP_ARTIST_ORDER                                                                                      \
+	"CASE WHEN NULLIF(artist,'') IS NULL THEN 1 ELSE 0 END, artist COLLATE listorder"
+
 // The single character a name is filed under in an A-Z index, and the group it
 // belongs to. Latin letters come back upper-cased; everything else is stored
 // as-is.
@@ -2931,6 +2935,17 @@ static void list_sql(char *sql, size_t size, const char *select, library_list_t 
 		return;
 	}
 
+	if (kind == LIBRARY_LIST_ALBUMS && (order == LIBRARY_ORDER_ARTIST || order == LIBRARY_ORDER_ARTIST_DESC)) {
+		const char *direction = order == LIBRARY_ORDER_ARTIST_DESC ? "DESC" : "ASC";
+		snprintf(sql, size,
+				 "SELECT %s FROM (SELECT g.rowid AS rowid, album, album_key, sortkey, " ALBUM_GROUP_ARTIST
+				 " AS artist FROM ALBUM_GROUP_TABLE g WHERE album <> '') ORDER BY " ALBUM_GROUP_ARTIST_ORDER
+				 " %s, artist COLLATE NOCASE %s, %s, album_key",
+				 select, direction, direction,
+				 list_uses_sortkey(kind) ? "sortkey" : "album COLLATE listorder");
+		return;
+	}
+
 	// Every record, artist and album artist by when it arrived. Their tables
 	// have no date of their own, so each is as new as the newest of its files:
 	// a record topped up with a bonus track moves up with it, and so does an
@@ -3025,7 +3040,7 @@ static const char *row_by_id_sql(library_list_t kind, const char *value, char *o
 		// its artist on a file that has none. Lists that show it read it from
 		// here; a window of rows is a dozen lookups on the album index.
 		return "SELECT " ALBUM_GROUP_VALUE ", " ALBUM_GROUP_FIRST("m.path") ","
-			   " " ALBUM_GROUP_FIRST("COALESCE(NULLIF(m.album_artist,''), m.artist)")
+			   " " ALBUM_GROUP_ARTIST
 			   " FROM ALBUM_GROUP_TABLE g WHERE rowid=?";
 	case LIBRARY_LIST_ARTISTS:
 		return "SELECT artist, NULL, NULL FROM ARTIST_TABLE WHERE rowid=?";
@@ -3115,7 +3130,9 @@ library_index_t *library_index_open(library_list_t kind, library_filter_t filter
 	// would land on the wrong rows, with the totals still adding up.
 	bool keyed = list_uses_sortkey(kind);
 	snprintf(rows_select, sizeof(rows_select), "rowid, %s", keyed ? "sortkey" : name_column(kind));
-	list_sql(count_sql, sizeof(count_sql), "COUNT(*)", kind, filter, value, order);
+	library_order_t count_order = order == LIBRARY_ORDER_ARTIST || order == LIBRARY_ORDER_ARTIST_DESC
+									 ? LIBRARY_ORDER_DEFAULT : order;
+	list_sql(count_sql, sizeof(count_sql), "COUNT(*)", kind, filter, value, count_order);
 	list_sql(rows_sql, sizeof(rows_sql), rows_select, kind, filter, value, order);
 	if (!rows_sql[0]) {
 		free(ix);
@@ -3204,7 +3221,8 @@ library_index_t *library_index_open(library_list_t kind, library_filter_t filter
 		bool by_name = kind != LIBRARY_LIST_FAVOURITES && kind != LIBRARY_LIST_PLAYLIST && kind != LIBRARY_LIST_YEARS &&
 					   kind != LIBRARY_LIST_MOST_PLAYED &&
 					   order != LIBRARY_ORDER_ALBUM && order != LIBRARY_ORDER_ADDED && order != LIBRARY_ORDER_YEAR &&
-					   order != LIBRARY_ORDER_YEAR_DESC &&
+					   order != LIBRARY_ORDER_YEAR_DESC && order != LIBRARY_ORDER_ARTIST &&
+					   order != LIBRARY_ORDER_ARTIST_DESC &&
 					   !(kind == LIBRARY_LIST_TRACKS && filter == LIBRARY_FILTER_ALBUM);
 		ix->buckets_valid = by_name && ix->count > 0;
 	}

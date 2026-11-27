@@ -1094,6 +1094,7 @@ static lv_obj_t *allow_delete_switch;
 static lv_obj_t *library_screen;
 static lv_obj_t *album_view_switch;
 static lv_obj_t *album_head_switch;
+static lv_obj_t *album_head_muted_row;
 static lv_obj_t *quality_badges_switch;
 static lv_obj_t *play_counts_switch;
 static lv_obj_t *go_to_current_switch;
@@ -1343,7 +1344,13 @@ static void album_view_cb(lv_event_t *e) {
 }
 
 static void album_head_cb(lv_event_t *e) {
-	medialist_set_album_head(lv_obj_has_state(lv_event_get_target(e), LV_STATE_CHECKED));
+	bool enabled = lv_obj_has_state(lv_event_get_target(e), LV_STATE_CHECKED);
+	medialist_set_album_head(enabled);
+	lv_obj_set_hidden(album_head_muted_row, !enabled);
+}
+
+static void album_head_muted_cb(lv_event_t *e) {
+	medialist_set_album_head_muted(lv_obj_has_state(lv_event_get_target(e), LV_STATE_CHECKED));
 }
 
 static lv_obj_t *nowplaying_at_boot_switch;
@@ -1509,9 +1516,16 @@ static void build_library_page(gui_config_t *cfg) {
 	// what the record is at the top with the tracks under it.
 	settingsrow_toggle(container, "musicsettings_album_head", &album_head_switch, album_head_cb);
 	option_note(container, "musicsettings_album_head_note");
-	if (medialist_album_head()) {
+	bool album_head_on = medialist_album_head();
+	if (album_head_on) {
 		lv_obj_add_state(album_head_switch, LV_STATE_CHECKED);
 	}
+	lv_obj_t *muted_switch;
+	album_head_muted_row = settingsrow_toggle(container, "Mute album background", &muted_switch, album_head_muted_cb);
+	if (medialist_album_head_muted()) {
+		lv_obj_add_state(muted_switch, LV_STATE_CHECKED);
+	}
+	lv_obj_set_hidden(album_head_muted_row, !album_head_on);
 
 	// Who a row is by, under its title, on the lists picked here.
 	settingsrow_toggle_pills(container, "musicsettings_show_artist", artist_toggle_cb, &artist_switch, &artist_pills);

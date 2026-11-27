@@ -74,6 +74,10 @@ bool display_rotation_supported(void);
 bool display_get_rotated(void);
 void display_set_rotated(bool rotated);
 
+// Stage visualiser frames in RAM and pace hardware page flips while the
+// visualiser is open. Call on the UI thread.
+void display_set_visualiser_presentation(bool enabled);
+
 // A copy of what is on screen right now, in RGB565, for screenshots. Lives in
 // main.c for the same reason as the three above: only the framebuffer owner
 // knows which of the two pages is the visible one.

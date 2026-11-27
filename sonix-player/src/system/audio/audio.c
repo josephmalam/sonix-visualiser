@@ -724,6 +724,28 @@ static int parse_wav(const char *filepath, wav_info_t *info, FILE **file_out) {
 	return WAV_OK;
 }
 
+double audio_file_duration(const char *path) {
+	decode_format_t format = decode_detect_format(path);
+	if (format == DECODE_FORMAT_UNKNOWN) {
+		wav_info_t info;
+		FILE *file;
+		if (parse_wav(path, &info, &file) != WAV_OK) {
+			return 0;
+		}
+		fclose(file);
+		return (double)(info.data_size / info.src_frame_bytes) / info.sample_rate;
+	}
+
+	decoder_t *dec = decoder_open_info(path, format);
+	if (!dec) {
+		return 0;
+	}
+	uint64_t frames = decoder_total_pcm_frames(dec);
+	int rate = decoder_sample_rate(dec);
+	decoder_close(dec);
+	return rate > 0 ? (double)frames / rate : 0;
+}
+
 // Turns `frames` frames read from the file into the samples the device takes.
 // Only called for the encodings that need it: S16 and S32 are read straight
 // into the output buffer.

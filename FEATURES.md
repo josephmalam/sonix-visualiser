@@ -26,14 +26,14 @@ This is everything Sonix Player can do today, on both the **R1** and the **R3 Pr
 - **Main page** - All tracks, Albums, Artists, Album artists, Genres, Years, Favourites, Most played, Playlists and Browse. You can rearrange the tiles and hide the ones you don't use.
 - **Browse** - go through the folders of the card as they are.
 - **Search** across tracks, albums and artists.
-- **Sorting** - by name (A-Z or Z-A), by date added (newest or oldest first) or by year.
+- **Sorting** - by name, date added or year. Albums can also be grouped by artist A-Z or Z-A, with album titles A-Z within each artist.
 - **A-Z bar** on the side when you scroll a long list.
 - **Sorting works with every alphabet**, ignores upper and lower case and accents, and skips words like "The" at the start (you can turn that off).
 - **Albums with the same name stay apart** when they belong to different artists or folders.
 - **Split artists and genres** - a track with "A & B" or "A feat. B" shows up under both names. You choose the symbols that split them, and you can add names that must never be split.
 - **Join albums** - tracks of the same album in the same folder become one album, even if the artists are different.
 - **Detect changes** - new tracks are added by themselves when the player starts, when the microSD goes back in, after USB or after Wi-Fi transfer. It can also pick up tracks you retagged.
-- **Alternative album view** - the album opens with its big cover on top, with title, artist, genre and year, and the tracks underneath.
+- **Alternative album view** - one cover above the title, artist, track count, total duration, year, and Play and Shuffle buttons. Long titles and artist names scroll. Track durations appear beside play counts. The muted background option uses a gradient across albums.
 - **Tapping an artist, a genre or a year** can open its albums instead of its tracks.
 - **Show artist** under the title in the lists you choose.
 - **Quality badge** under the title: lossy, CD, Hi-Res or DSD.

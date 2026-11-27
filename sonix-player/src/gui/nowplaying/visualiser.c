@@ -17,7 +17,12 @@
 #include "src/system/core/lang.h"
 #include "src/system/device/power.h"
 
-#define FRAME_MS 33
+#define FRAME_MS (2 * LV_DEF_REFR_PERIOD)
+#define CONTROL_HIT_PADDING 16
+#define RIDGE_COUNT 42
+#define RIDGE_MAX_PEAKS 4
+#define PULSE_EDGE_BLEED 2
+#define PULSE_BANDS 16
 #define CONTROLS_MS 2500
 #define CONTROLS_FADE_MS 250
 #define STEPS 32
@@ -30,6 +35,7 @@
 #define SUBPIXEL_BITS 8
 #define SUBPIXEL (1 << SUBPIXEL_BITS)
 #define SINE_SIZE 256
+#define PULSE_FFT_SIZE SINE_SIZE
 #define TWO_PI 6.28318530718f
 #define TUNING_STEP 25
 
@@ -51,8 +57,21 @@ static float shape_phase, starting_hue = -1;
 static float tunnel_travel;
 static float bass, mid, treble;
 static float target_bass, target_mid, target_treble, pulse;
+static float pulse_target[PULSE_BANDS], pulse_level[PULSE_BANDS];
 static unsigned beat_cooldown, silent_frames;
 static uint32_t random_state;
+
+typedef struct {
+	float position, width, height, skew, phase;
+} ridge_peak_t;
+
+typedef struct {
+	unsigned count;
+	float phase;
+	ridge_peak_t peaks[RIDGE_MAX_PEAKS];
+} pulse_ridge_t;
+
+static pulse_ridge_t pulse_ridges[RIDGE_COUNT];
 
 typedef struct {
 	float distance, angle, speed, glow, age;
@@ -85,6 +104,16 @@ typedef struct {
 
 static visualiser_tuning_t motion_speed = {"Motion speed", "speed", 50, 150, 100, NULL};
 static visualiser_tuning_t music_response = {"Music response", "response", 0, 200, 100, NULL};
+typedef enum {
+	VISUALISER_RIBBONS,
+	VISUALISER_PULSE_LINES,
+	VISUALISER_STYLE_COUNT,
+} visualiser_style_t;
+
+static visualiser_style_t style;
+static lv_obj_t *style_pills[VISUALISER_STYLE_COUNT];
+static lv_obj_t *ribbon_options;
+static bool reset_trails;
 static bool settings_dirty;
 
 // A table keeps trigonometry out of the inner drawing loop on the R1. Angles
@@ -100,11 +129,17 @@ static float wave(float turns) {
 	return sine_table[slot] + (sine_table[(slot + 1) & (SINE_SIZE - 1)] - sine_table[slot]) * fraction;
 }
 
+static float random_unit_from(uint32_t *state) {
+	uint32_t sample = *state;
+	sample ^= sample << 13;
+	sample ^= sample >> 17;
+	sample ^= sample << 5;
+	*state = sample;
+	return (sample >> 8) * (1.0f / 16777216.0f);
+}
+
 static float random_unit(void) {
-	random_state ^= random_state << 13;
-	random_state ^= random_state >> 17;
-	random_state ^= random_state << 5;
-	return (random_state >> 8) * (1.0f / 16777216.0f);
+	return random_unit_from(&random_state);
 }
 
 static float next_starting_hue(void) {
@@ -125,6 +160,59 @@ static float follow(float current, float target, float elapsed, float rise, floa
 	return current + (target - current) * smoothing;
 }
 
+// Window and analyse the existing short PCM snapshot, on the UI thread.
+// Log-spaced bands keep bass and mids useful instead of leaving most rows
+// to the top octave. Only Pulse lines needs the extra analysis.
+static void read_pulse_bands(const visualiser_audio_frame_t *frame) {
+	static const int edges[PULSE_BANDS + 1] = {
+		0, 90, 140, 200, 270, 360, 480, 630, 820, 1070, 1390, 1800, 2310, 2970, 3760, 4750, 6500,
+	};
+	float re[PULSE_FFT_SIZE], im[PULSE_FFT_SIZE] = {0};
+	size_t count = frame->count < PULSE_FFT_SIZE ? frame->count : PULSE_FFT_SIZE;
+
+	// Load the Hann-windowed input in bit-reversed order for the radix-2 FFT.
+	for (unsigned i = 0, j = 0; i < PULSE_FFT_SIZE; i++) {
+		unsigned angle = i * SINE_SIZE / count;
+		float window = .5f - .5f * sine_table[(angle + SINE_SIZE / 4) & (SINE_SIZE - 1)];
+		re[j] = i < count ? window * (frame->samples[i] / 32768.0f) : 0;
+		unsigned bit = PULSE_FFT_SIZE / 2;
+		while (j & bit) {
+			j ^= bit;
+			bit >>= 1;
+		}
+		j ^= bit;
+	}
+	for (unsigned span = 2; span <= PULSE_FFT_SIZE; span *= 2) {
+		unsigned half = span / 2;
+		for (unsigned offset = 0; offset < half; offset++) {
+			unsigned angle = offset * SINE_SIZE / span;
+			float c = sine_table[(angle + SINE_SIZE / 4) & (SINE_SIZE - 1)];
+			float s = -sine_table[angle];
+			for (unsigned i = offset; i < PULSE_FFT_SIZE; i += span) {
+				unsigned j = i + half;
+				float r = c * re[j] - s * im[j];
+				float n = s * re[j] + c * im[j];
+				re[j] = re[i] - r;
+				im[j] = im[i] - n;
+				re[i] += r;
+				im[i] += n;
+			}
+		}
+	}
+
+	unsigned bin = 1; // skip DC
+	float norm = 16.0f / (count * count); // Hann window and single-sided amplitude
+	for (unsigned band = 0; band < PULSE_BANDS; band++) {
+		float peak = 0;
+		while (bin <= PULSE_FFT_SIZE / 2 && bin * (unsigned)frame->rate < edges[band + 1] * PULSE_FFT_SIZE) {
+			float energy = re[bin] * re[bin] + im[bin] * im[bin];
+			peak = fmaxf(peak, energy);
+			bin++;
+		}
+		pulse_target[band] = fminf(sqrtf(sqrtf(peak * norm)), 1);
+	}
+}
+
 static void read_levels(uint32_t now) {
 	if (beat_cooldown > 0) {
 		beat_cooldown--;
@@ -134,6 +222,9 @@ static void read_levels(uint32_t now) {
 	float low = 0, middle = 0, high = 0;
 	if (visualiser_audio_take(&frame, now)) {
 		silent_frames = 0;
+		if (style == VISUALISER_PULSE_LINES) {
+			read_pulse_bands(&frame);
+		}
 		float a = 1.0f - expf(-TWO_PI * 170.0f / frame.rate);
 		float b = 1.0f - expf(-TWO_PI * 2100.0f / frame.rate);
 		float slow = 0, fast = 0;
@@ -153,6 +244,8 @@ static void read_levels(uint32_t now) {
 		// Hold the last levels briefly so a gap does not invent a bass hit.
 		silent_frames++;
 		return;
+	} else {
+		memset(pulse_target, 0, sizeof(pulse_target));
 	}
 	target_bass = low;
 	target_mid = middle;
@@ -174,6 +267,12 @@ static void advance_motion(float elapsed) {
 	// PCM arrives in batches. Ease toward the latest levels on every drawing
 	// tick so a new batch doesn't suddenly bend or stretch the whole picture.
 	float response = music_response.percent * .01f;
+	if (style == VISUALISER_PULSE_LINES) {
+		for (unsigned band = 0; band < PULSE_BANDS; band++) {
+			float energy = fminf(pulse_target[band] * response, 1);
+			pulse_level[band] = follow(pulse_level[band], energy, elapsed, 38, 105 + band * 3);
+		}
+	}
 	bass = follow(bass, fminf(target_bass * response, 1), elapsed, 60, 145);
 	mid = follow(mid, fminf(target_mid * response, 1), elapsed, 95, 180);
 	treble = follow(treble, fminf(target_treble * response, 1), elapsed, 75, 150);
@@ -514,6 +613,130 @@ static void draw_sparks(float step) {
 	}
 }
 
+// Each column owns the two half-segments to its neighbours. Fill between
+// their midpoints and the sample so steep peaks stay connected. The horizon
+// clips the stroke against traces already drawn in front of it.
+static void draw_pulse_trace(const int *trace, int *horizon, uint16_t ink) {
+	int left = trace[0];
+	for (int x = 0; x < width; x++) {
+		int sample = trace[x];
+		int right = x + 1 < width ? (sample + trace[x + 1]) / 2 : sample;
+		int top = LV_MIN(sample, LV_MIN(left, right));
+		int bottom = LV_MAX(sample, LV_MAX(left, right));
+		left = right;
+
+		int first = top >> SUBPIXEL_BITS;
+		int last = (bottom + SUBPIXEL - 1) >> SUBPIXEL_BITS;
+		int stop = LV_MIN(last, horizon[x] - 1);
+		for (int y = LV_MAX(0, first); y <= stop; y++) {
+			unsigned coverage = SUBPIXEL;
+			if (y == first) {
+				coverage -= (unsigned)top & (SUBPIXEL - 1);
+			}
+			if (y == last && (bottom & (SUBPIXEL - 1))) {
+				coverage = (unsigned)bottom & (SUBPIXEL - 1);
+			}
+			if (coverage == SUBPIXEL) {
+				pixels[y * width + x] = ink;
+			} else {
+				point_coverage(false, x, y, ink, coverage);
+			}
+		}
+		horizon[x] = LV_MIN(horizon[x], first);
+	}
+}
+
+static void init_pulse_ridges(void) {
+	uint32_t seed = 0x5ea47d23u;
+	for (int row = 0; row < RIDGE_COUNT; row++) {
+		pulse_ridge_t *ridge = &pulse_ridges[row];
+		ridge->phase = random_unit_from(&seed);
+		ridge->count = 2 + (unsigned)(random_unit_from(&seed) * (RIDGE_MAX_PEAKS - 1));
+		unsigned main_peak = (unsigned)(random_unit_from(&seed) * ridge->count);
+		float spacing = 1.64f / ridge->count;
+		for (unsigned i = 0; i < ridge->count; i++) {
+			ridge_peak_t *peak = &ridge->peaks[i];
+			// One peak per section, with room for both close pairs and gaps.
+			peak->position = -.82f + (i + .15f + .70f * random_unit_from(&seed)) * spacing;
+			peak->width = .20f + .24f * random_unit_from(&seed);
+			peak->height = i == main_peak ? .84f + .16f * random_unit_from(&seed)
+										  : .31f + .47f * random_unit_from(&seed);
+			peak->skew = .72f + .56f * random_unit_from(&seed);
+			peak->phase = random_unit_from(&seed);
+		}
+	}
+}
+
+// Bass occupies the bottom of the stack, with narrower contours near the top.
+static void draw_pulse_lines(void) {
+	memset(pixels, 0, (size_t)width * height * sizeof(*pixels));
+
+	int trace[width];
+	int horizon[width];
+	for (int x = 0; x < width; x++) {
+		horizon[x] = height;
+	}
+	float inv_width = 1.0f / (width - 1);
+	for (int row = RIDGE_COUNT - 1; row >= 0; row--) {
+		float lane = (float)row / (RIDGE_COUNT - 1);
+		float band_pos = (1 - lane) * (PULSE_BANDS - 1);
+		unsigned band = (unsigned)band_pos;
+		unsigned next = band < PULSE_BANDS - 1 ? band + 1 : band;
+		float energy = pulse_level[band] + (pulse_level[next] - pulse_level[band]) * (band_pos - band);
+
+		const pulse_ridge_t *ridge = &pulse_ridges[row];
+		float lane_phase = ridge->phase + (row % 3 + 1) * twist;
+		float center = .5f + (.025f + .023f * energy) * wave(lane_phase - 3 * drift);
+		float inv_radius = 1 / (1.20f * (.18f + .045f * energy));
+		float baseline = height * (.025f + lane * .96f);
+		float lift = .80f * fminf(height * (.035f + .126f * energy), baseline * .88f);
+		float ripple_rate = 11 + 9 * ridge->phase;
+		float detail_rate = 4.6f + 2.6f * (1 - lane) + 3.5f * ridge->phase;
+		unsigned value = 18 + (unsigned)(6 * lane + 7 * energy);
+		uint16_t ink = (uint16_t)rgb565(value, value * 2, value);
+
+		float position[RIDGE_MAX_PEAKS], left_slope[RIDGE_MAX_PEAKS], right_slope[RIDGE_MAX_PEAKS];
+		float amplitude[RIDGE_MAX_PEAKS];
+		for (unsigned i = 0; i < ridge->count; i++) {
+			const ridge_peak_t *peak = &ridge->peaks[i];
+			float sway = wave(peak->phase + 2 * drift - (i % 2 + 1) * shape_phase);
+			position[i] = peak->position + (.045f + .07f * energy) * sway;
+			float inverse_width = 1 / (peak->width * (.84f + .16f * lane));
+			left_slope[i] = inverse_width / peak->skew;
+			right_slope[i] = inverse_width * peak->skew;
+			amplitude[i] = peak->height * (.91f + .09f * wave(peak->phase + 2 * twist));
+		}
+
+		for (int x = 0; x < width; x++) {
+			float u = x * inv_width;
+			float distance = (u - center) * inv_radius;
+			float edge = fminf(1, 20 * fminf(u, 1 - u));
+			float y = baseline + edge * (.62f * wave(u * (2.5f + 3 * ridge->phase) + lane_phase) +
+										 .36f * wave(u * ripple_rate - 2 * lane_phase) +
+										 .15f * wave(u * (ripple_rate * 1.9f + 5) + ridge->phase));
+			if (fabsf(distance) < 1) {
+				float crest = 0;
+				for (unsigned i = 0; i < ridge->count; i++) {
+					float offset = distance - position[i];
+					float slope = offset < 0 ? left_slope[i] : right_slope[i];
+					float span = offset * slope;
+					float shape = fmaxf(0, 1 - span * span);
+					// Rounded tops and a smooth join where neighbouring peaks overlap.
+					crest += (1 - crest) * amplitude[i] * shape * shape;
+				}
+				float shoulder = 1 - distance * distance;
+				float taper = fminf(1, shoulder * 3);
+				float fold = wave(distance * (1.25f + 1.2f * ridge->phase) + lane_phase);
+				float ripple = wave(distance * detail_rate - lane_phase + shape_phase);
+				float body = .16f + .08f * fold + .026f * ripple;
+				y -= lift * (body * shoulder * shoulder + .83f * taper * crest);
+			}
+			trace[x] = (int)(y * SUBPIXEL);
+		}
+		draw_pulse_trace(trace, horizon, ink);
+	}
+}
+
 static void set_controls_opacity(lv_opa_t opacity) {
 	lv_obj_set_style_opa(close_button, opacity, 0);
 	lv_obj_set_style_opa(settings_button, opacity, 0);
@@ -599,6 +822,32 @@ static void add_tuning_slider(lv_obj_t *panel, visualiser_tuning_t *tuning) {
 	lv_obj_add_event_cb(slider, tuning_changed, LV_EVENT_VALUE_CHANGED, tuning);
 }
 
+static void style_refresh(void) {
+	for (int i = 0; i < VISUALISER_STYLE_COUNT; i++) {
+		settingsrow_pill_active(style_pills[i], i == (int)style);
+	}
+	lv_obj_set_hidden(ribbon_options, style != VISUALISER_RIBBONS);
+	// LVGL's bilinear scaler blends the image boundary with transparency.
+	// Move both boundaries beyond the panel so horizontal traces stay bright
+	// into the first and last visible columns.
+	int screen_width = lv_display_get_horizontal_resolution(lv_obj_get_display(image));
+	lv_obj_set_width(image, style == VISUALISER_PULSE_LINES ? screen_width + 2 * PULSE_EDGE_BLEED : lv_pct(100));
+}
+
+static void style_clicked(lv_event_t *e) {
+	visualiser_style_t selected = (visualiser_style_t)(intptr_t)lv_event_get_user_data(e);
+	if (selected == style) {
+		return;
+	}
+	style = selected;
+	memset(pulse_target, 0, sizeof(pulse_target));
+	memset(pulse_level, 0, sizeof(pulse_level));
+	reset_trails = true;
+	config_set_int("visualiser", "style", style);
+	settings_dirty = true;
+	style_refresh();
+}
+
 static void build_settings(void) {
 	settings_veil = lv_obj_create(screen);
 	lv_obj_remove_style_all(settings_veil);
@@ -624,11 +873,27 @@ static void build_settings(void) {
 	lv_label_set_text(title, tr("settings"));
 	lv_obj_add_style(title, &theme_style_text, 0);
 	lv_obj_set_style_text_font(title, &font_ui_28, 0);
-	add_layer_toggle(panel, &sharp_layer);
-	add_layer_toggle(panel, &sharp_antialias);
-	add_layer_toggle(panel, &soft_layer);
-	add_layer_toggle(panel, &spark_layer);
-	add_layer_toggle(panel, &tunnel_layer);
+	lv_obj_t *pills;
+	settingsrow_pills(panel, "Visualiser style", &pills);
+	style_pills[VISUALISER_RIBBONS] = settingsrow_pill(pills, "Ribbons", VISUALISER_RIBBONS, style_clicked);
+	style_pills[VISUALISER_PULSE_LINES] =
+		settingsrow_pill(pills, "Pulse lines", VISUALISER_PULSE_LINES, style_clicked);
+	style = config_get_int("visualiser", "style", VISUALISER_RIBBONS) == VISUALISER_PULSE_LINES
+				? VISUALISER_PULSE_LINES : VISUALISER_RIBBONS;
+
+	ribbon_options = lv_obj_create(panel);
+	lv_obj_remove_style_all(ribbon_options);
+	lv_obj_set_size(ribbon_options, lv_pct(100), LV_SIZE_CONTENT);
+	lv_obj_set_scrollable(ribbon_options, false);
+	lv_obj_set_flex_flow(ribbon_options, LV_FLEX_FLOW_COLUMN);
+	lv_obj_set_style_pad_row(ribbon_options, 6, 0);
+	add_layer_toggle(ribbon_options, &sharp_layer);
+	add_layer_toggle(ribbon_options, &sharp_antialias);
+	add_layer_toggle(ribbon_options, &soft_layer);
+	add_layer_toggle(ribbon_options, &spark_layer);
+	add_layer_toggle(ribbon_options, &tunnel_layer);
+	style_refresh();
+	theme_register_refresh(style_refresh);
 	add_tuning_slider(panel, &motion_speed);
 	add_tuning_slider(panel, &music_response);
 	lv_obj_set_hidden(settings_veil, true);
@@ -648,11 +913,19 @@ static void frame_cb(lv_timer_t *t) {
 	}
 	read_levels(now);
 	advance_motion(elapsed);
-	fade_trails();
-	if (tunnel_layer.enabled) draw_tunnel();
-	if (soft_layer.enabled) draw_ribbons(true);
-	if (sharp_layer.enabled) draw_ribbons(false);
-	if (spark_layer.enabled) draw_sparks((float)elapsed / FRAME_MS * (motion_speed.percent * .01f));
+	if (style == VISUALISER_PULSE_LINES) {
+		draw_pulse_lines();
+	} else {
+		// Keep the previous picture up until its replacement has been drawn.
+		// Clearing from the settings callback can present an empty frame.
+		if (reset_trails) memset(pixels, 0, (size_t)width * height * sizeof(*pixels));
+		else fade_trails();
+		if (tunnel_layer.enabled) draw_tunnel();
+		if (soft_layer.enabled) draw_ribbons(true);
+		if (sharp_layer.enabled) draw_ribbons(false);
+		if (spark_layer.enabled) draw_sparks((float)elapsed / FRAME_MS * (motion_speed.percent * .01f));
+	}
+	reset_trails = false;
 	lv_obj_invalidate(image);
 
 	uint32_t controls_elapsed = lv_tick_elaps(controls_at);
@@ -672,6 +945,7 @@ static void frame_cb(lv_timer_t *t) {
 static void screen_loaded(lv_event_t *e) {
 	(void)e;
 	power_hold_screen_for_visualiser(true);
+	display_set_visualiser_presentation(true);
 	topbar_set_hidden(true);
 	reveal_controls();
 	visualiser_audio_frame_t old;
@@ -679,14 +953,16 @@ static void screen_loaded(lv_event_t *e) {
 	frame_at = now - FRAME_MS;
 	visualiser_audio_take(&old, now);
 	visualiser_audio_set_active(true);
+	frame_cb(timer);
+	lv_timer_reset(timer);
 	lv_timer_resume(timer);
-	lv_timer_ready(timer);
 }
 
 static void screen_unloaded(lv_event_t *e) {
 	(void)e;
 	hide_settings();
 	power_hold_screen_for_visualiser(false);
+	display_set_visualiser_presentation(false);
 	visualiser_audio_set_active(false);
 	lv_timer_pause(timer);
 	lv_image_set_src(image, NULL);
@@ -698,6 +974,7 @@ static void screen_unloaded(lv_event_t *e) {
 static lv_obj_t *build_button(lv_align_t align, int padding, const lv_image_dsc_t *icon, lv_event_cb_t cb) {
 	lv_obj_t *button = lv_button_create(screen);
 	lv_obj_set_size(button, 56, 56);
+	lv_obj_set_ext_click_area(button, CONTROL_HIT_PADDING);
 	lv_obj_align(button, align, align == LV_ALIGN_TOP_LEFT ? padding : -padding, padding);
 	lv_obj_set_style_bg_color(button, lv_color_black(), 0);
 	lv_obj_set_style_bg_opa(button, LV_OPA_70, 0);
@@ -708,6 +985,7 @@ static lv_obj_t *build_button(lv_align_t align, int padding, const lv_image_dsc_
 	lv_image_set_src(glyph, icon);
 	lv_obj_set_style_image_recolor(glyph, lv_color_white(), 0);
 	lv_obj_set_style_image_recolor_opa(glyph, LV_OPA_COVER, 0);
+	lv_obj_set_clickable(glyph, false);
 	lv_obj_center(glyph);
 	return button;
 }
@@ -723,7 +1001,9 @@ static void build(gui_config_t *cfg) {
 	lv_obj_add_event_cb(screen, screen_unloaded, LV_EVENT_SCREEN_UNLOADED, NULL);
 
 	image = lv_image_create(screen);
-	lv_obj_set_size(image, cfg->screen_width, cfg->screen_height);
+	lv_obj_set_size(image, lv_pct(100), lv_pct(100));
+	lv_obj_center(image);
+	lv_obj_set_clickable(image, false);
 	lv_image_set_inner_align(image, LV_IMAGE_ALIGN_STRETCH);
 
 	build_settings();
@@ -736,6 +1016,7 @@ static void build(gui_config_t *cfg) {
 	for (int i = 0; i < SINE_SIZE; i++) {
 		sine_table[i] = sinf(i * (TWO_PI / SINE_SIZE));
 	}
+	init_pulse_ridges();
 }
 
 void visualiser_open(gui_config_t *cfg) {
@@ -772,6 +1053,8 @@ void visualiser_open(gui_config_t *cfg) {
 	hue = next_starting_hue();
 	tunnel_travel = 0;
 	bass = mid = treble = target_bass = target_mid = target_treble = 0;
+	memset(pulse_target, 0, sizeof(pulse_target));
+	memset(pulse_level, 0, sizeof(pulse_level));
 	beat = pulse = bass_floor = previous_low = spark_budget = 0;
 	beat_cooldown = silent_frames = next_spark = 0;
 	memset(sparks, 0, sizeof(sparks));

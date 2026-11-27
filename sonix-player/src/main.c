@@ -1243,6 +1243,7 @@ static bool host_rotated;
 bool display_rotation_supported(void) { return false; }
 bool display_get_rotated(void) { return host_rotated; }
 void display_set_rotated(bool rotated) { host_rotated = rotated; }
+void display_set_visualiser_presentation(bool enabled) { (void)enabled; }
 
 // The touch panel on the simulator is the mouse inside the SDL window: there
 // is no evdev node to hand over, and nothing to switch off.
@@ -1308,7 +1309,7 @@ static size_t fb_page_size;
 static struct fb_var_screeninfo fb_var;
 
 // ---------------------------------------------------------------------------
-// 180 degree rotation ("Rotate screen")
+// Staged rendering for rotation and the visualiser
 //
 // LVGL 9.1 has no display rotation of its own (it arrives in 9.2), and the
 // panel cannot be told to scan out upside down. So when the option is on the
@@ -1331,13 +1332,19 @@ static struct fb_var_screeninfo fb_var;
 static lv_display_t *fb_display;   // the page-flipping display, NULL on the fallback
 static lv_indev_t *fb_touch;	   // so the calibration can be flipped with the screen
 static bool fb_rotated;
-static uint8_t *rot_page;		   // the RAM page LVGL draws into while rotated
+static bool fb_visualiser;
+static uint8_t *staging_page;
+static uint32_t fb_visualiser_flip_at;
+
+// Leave a refresh interval between visualiser page submissions. UI
+// invalidations can otherwise trigger an extra flip between drawing ticks.
+#define FB_VISUALISER_RETIRE_MS 18
 
 // What this frame touched, and what each framebuffer page has not been given
 // yet (a bounding box each -- cheap, and a frame's damage is one region in
 // practice). Empty is x1 > x2.
-static lv_area_t rot_frame_dirty;
-static lv_area_t rot_page_pending[2];
+static lv_area_t staged_frame_dirty;
+static lv_area_t staged_page_pending[2];
 
 static void area_clear(lv_area_t *a) {
 	a->x1 = 1;
@@ -1395,47 +1402,83 @@ static void blit_rotated_180(uint16_t *dst, const uint16_t *src, const lv_area_t
 	}
 }
 
-static void fb_pan_flush_cb(lv_display_t *disp, const lv_area_t *area, uint8_t *px) {
-	bool second_page;
-
+static void blit_staged(uint8_t *dst, const uint8_t *src, const lv_area_t *area) {
+	int32_t width = (int32_t)fb_var.xres;
+	int32_t height = (int32_t)fb_var.yres;
 	if (fb_rotated) {
-		// Collect this frame's damage; the copy happens once, on the last
-		// area, into the page that is NOT on screen.
-		area_merge(&rot_frame_dirty, area);
-		if (!lv_display_flush_is_last(disp)) {
+		blit_rotated_180((uint16_t *)dst, (const uint16_t *)src, area, width, height);
+		return;
+	}
+
+	size_t stride = (size_t)width * sizeof(uint16_t);
+	size_t offset = (size_t)area->y1 * stride;
+	if (area->x1 == 0 && area->x2 == width - 1) {
+		memcpy(dst + offset, src + offset, (size_t)(area->y2 - area->y1 + 1) * stride);
+		return;
+	}
+	offset += (size_t)area->x1 * sizeof(uint16_t);
+	size_t bytes = (size_t)(area->x2 - area->x1 + 1) * sizeof(uint16_t);
+	for (int32_t y = area->y1; y <= area->y2; y++, offset += stride) {
+		memcpy(dst + offset, src + offset, bytes);
+	}
+}
+
+static bool fb_present_page(bool second_page) {
+	struct fb_var_screeninfo next = fb_var;
+	next.yoffset = second_page ? fb_var.yres : 0;
+	if (ioctl(fb_fd, FBIOPAN_DISPLAY, &next) < 0) {
+		static bool warned;
+		if (!warned) {
+			perror("fb: FBIOPAN_DISPLAY");
+			warned = true;
+		}
+		return false;
+	}
+	fb_var.yoffset = next.yoffset;
+	return true;
+}
+
+static void fb_bind_direct_buffers(lv_display_t *disp) {
+	bool second_is_visible = fb_var.yoffset != 0;
+	uint8_t *first = second_is_visible ? fb_mem : fb_mem + fb_page_size;
+	uint8_t *second = second_is_visible ? fb_mem + fb_page_size : fb_mem;
+	lv_display_set_buffers(disp, first, second, (uint32_t)fb_page_size, LV_DISPLAY_RENDER_MODE_DIRECT);
+}
+
+static void fb_pan_flush_cb(lv_display_t *disp, const lv_area_t *area, uint8_t *px) {
+	bool staged = fb_rotated || fb_visualiser;
+	if (staged) {
+		area_merge(&staged_frame_dirty, area);
+	}
+	if (!lv_display_flush_is_last(disp)) {
+		lv_display_flush_ready(disp);
+		return;
+	}
+
+	if (staged) {
+		if (fb_visualiser && lv_tick_elaps(fb_visualiser_flip_at) < FB_VISUALISER_RETIRE_MS) {
+			// Present the newest complete image on the next visualiser tick.
+			// Retain the damage so partial redraws cannot get lost.
 			lv_display_flush_ready(disp);
 			return;
 		}
 
-		second_page = (fb_var.yoffset == 0); // flip to the other page
+		bool second_page = fb_var.yoffset == 0;
 		int target = second_page ? 1 : 0;
+		lv_area_t redraw = staged_page_pending[target];
+		area_merge(&redraw, &staged_frame_dirty);
+		blit_staged(fb_mem + (second_page ? fb_page_size : 0), px, &redraw);
 
-		// Everything this page still owes, plus what just changed.
-		lv_area_t redraw = rot_page_pending[target];
-		area_merge(&redraw, &rot_frame_dirty);
-
-		if (!area_is_empty(&redraw)) {
-			blit_rotated_180((uint16_t *)(fb_mem + (second_page ? fb_page_size : 0)), (const uint16_t *)px, &redraw,
-							 (int32_t)fb_var.xres, (int32_t)fb_var.yres);
+		if (fb_visualiser) {
+			fb_visualiser_flip_at = lv_tick_get();
 		}
-
-		area_clear(&rot_page_pending[target]);
-		area_merge(&rot_page_pending[target ? 0 : 1], &rot_frame_dirty); // the other page still owes it
-		area_clear(&rot_frame_dirty);
+		if (fb_present_page(second_page)) {
+			area_clear(&staged_page_pending[target]);
+			area_merge(&staged_page_pending[target ^ 1], &staged_frame_dirty);
+			area_clear(&staged_frame_dirty);
+		}
 	} else {
-		second_page = (px >= fb_mem + fb_page_size);
-	}
-
-	if (lv_display_flush_is_last(disp)) {
-		fb_var.yoffset = second_page ? fb_var.yres : 0;
-		if (ioctl(fb_fd, FBIOPAN_DISPLAY, &fb_var) < 0) {
-			// One warning, not one per frame.
-			static bool warned;
-			if (!warned) {
-				perror("fb: FBIOPAN_DISPLAY");
-				warned = true;
-			}
-		}
+		fb_present_page(px >= fb_mem + fb_page_size);
 	}
 	lv_display_flush_ready(disp);
 }
@@ -1508,13 +1551,45 @@ static lv_display_t *try_panned_display(void) {
 	}
 
 	lv_display_set_color_format(disp, LV_COLOR_FORMAT_RGB565);
-	lv_display_set_buffers(disp, fb_mem, fb_mem + fb_page_size, (uint32_t)fb_page_size,
-						   LV_DISPLAY_RENDER_MODE_DIRECT);
+	fb_bind_direct_buffers(disp);
 	lv_display_set_flush_cb(disp, fb_pan_flush_cb);
 	fb_display = disp;
 
 	printf("fb: double-buffered, page flip on FBIOPAN_DISPLAY (%ux%u)\n", fb_var.xres, fb_var.yres);
 	return disp;
+}
+
+// The R1's soc_fb driver can return from PAN_DISPLAY before the controller
+// has latched the new descriptor. With two directly rendered pages LVGL can
+// then start drawing into the page still being scanned. Use the driver's
+// completion wait while the visualiser is presenting continuous full frames.
+static void fb_set_scanout_sync(bool enabled) {
+	static const char path[] = "/sys/module/soc_fb/parameters/pan_display_sync";
+	static bool changed;
+	if (fb_fd < 0 || changed == enabled) {
+		return;
+	}
+	if (enabled) {
+		FILE *param = fopen(path, "r");
+		if (!param) {
+			return;
+		}
+		int current = -1;
+		int read = fscanf(param, "%d", &current);
+		fclose(param);
+		if (read != 1 || current != 0) {
+			return;
+		}
+	}
+	int fd = open(path, O_WRONLY | O_CLOEXEC);
+	if (fd < 0) {
+		return;
+	}
+	char value = enabled ? '1' : '0';
+	if (write(fd, &value, 1) == 1) {
+		changed = enabled;
+	}
+	close(fd);
 }
 
 // A copy of what the panel is showing right now.
@@ -1596,15 +1671,49 @@ void display_wake_end(lv_display_t *disp) {
 	lv_linux_fbdev_set_force_refresh(disp, false);
 }
 
-// Frees the RAM pages once the refresh that may still be reading them is
-// over: an async call runs at the top of the next lv_timer_handler pass.
-static void free_rot_pages_cb(void *unused) {
+// The current LVGL event can still refer to the previous draw buffer.
+static void free_staging_page_cb(void *unused) {
 	(void)unused;
-	if (fb_rotated) {
-		return; // turned back on in the meantime
+	if (!fb_rotated && !fb_visualiser) {
+		free(staging_page);
+		staging_page = NULL;
 	}
-	free(rot_page);
-	rot_page = NULL;
+}
+
+static bool fb_configure_buffers(bool rotated, bool visualiser) {
+	if (rotated || visualiser) {
+		if (!staging_page) {
+			staging_page = malloc(fb_page_size);
+			if (!staging_page) {
+				fprintf(stderr, "fb: cannot allocate staging page (%zu bytes)\n", fb_page_size);
+				return false;
+			}
+		}
+		area_clear(&staged_frame_dirty);
+		area_set_full(&staged_page_pending[0]);
+		area_set_full(&staged_page_pending[1]);
+		lv_display_set_buffers(fb_display, staging_page, NULL, (uint32_t)fb_page_size, LV_DISPLAY_RENDER_MODE_DIRECT);
+	} else {
+		fb_bind_direct_buffers(fb_display);
+		lv_async_call(free_staging_page_cb, NULL);
+	}
+	fb_rotated = rotated;
+	fb_visualiser = visualiser;
+
+	lv_obj_invalidate(lv_screen_active());
+	lv_obj_invalidate(lv_layer_top());
+	lv_obj_invalidate(lv_layer_sys());
+	return true;
+}
+
+void display_set_visualiser_presentation(bool enabled) {
+	if (!fb_display) {
+		return;
+	}
+	fb_set_scanout_sync(enabled);
+	if (fb_visualiser != enabled && fb_configure_buffers(fb_rotated, enabled) && enabled) {
+		fb_visualiser_flip_at = lv_tick_get();
+	}
 }
 
 bool display_rotation_supported(void) { return fb_display != NULL; }
@@ -1633,29 +1742,8 @@ void display_set_rotated(bool rotated) {
 		return;
 	}
 
-	if (rotated) {
-		if (!rot_page) {
-			rot_page = malloc(fb_page_size);
-		}
-		if (!rot_page) {
-			fprintf(stderr, "fb: no memory for the rotated page (%zu bytes)\n", fb_page_size);
-			return;
-		}
-		memset(rot_page, 0, fb_page_size);
-
-		// Both framebuffer pages still hold the picture the right way up, so
-		// they each owe a full frame.
-		area_clear(&rot_frame_dirty);
-		area_set_full(&rot_page_pending[0]);
-		area_set_full(&rot_page_pending[1]);
-
-		lv_display_set_buffers(fb_display, rot_page, NULL, (uint32_t)fb_page_size, LV_DISPLAY_RENDER_MODE_DIRECT);
-		fb_rotated = true;
-	} else {
-		lv_display_set_buffers(fb_display, fb_mem, fb_mem + fb_page_size, (uint32_t)fb_page_size,
-							   LV_DISPLAY_RENDER_MODE_DIRECT);
-		fb_rotated = false;
-		lv_async_call(free_rot_pages_cb, NULL);
+	if (!fb_configure_buffers(rotated, fb_visualiser)) {
+		return;
 	}
 
 	// The touch panel turns with the picture: an inverted calibration maps
@@ -1667,15 +1755,6 @@ void display_set_rotated(bool rotated) {
 			lv_evdev_set_calibration(fb_touch, 0, 0, (int)fb_var.xres - 1, (int)fb_var.yres - 1);
 		}
 	}
-
-	// Both framebuffer pages still hold the picture the other way up. One
-	// invalidation is enough: the page bookkeeping above already has each
-	// page owing a full frame, so the next two flips repaint them both. No
-	// lv_refr_now() here, because this runs inside a settings event handler
-	// and rendering from one is unsafe.
-	lv_obj_invalidate(lv_screen_active());
-	lv_obj_invalidate(lv_layer_top());
-	lv_obj_invalidate(lv_layer_sys());
 
 	printf("fb: rotation %s\n", fb_rotated ? "on (180 degrees)" : "off");
 }
@@ -2404,6 +2483,7 @@ int main(int argc, char **argv) {
 		}
 	}
 
+	display_set_visualiser_presentation(false);
     playcount_flush();
 	library_close();
 	printf("\n");

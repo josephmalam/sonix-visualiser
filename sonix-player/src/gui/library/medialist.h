@@ -33,15 +33,12 @@ void medialist_init(gui_config_t *cfg);
 bool medialist_album_view(void);
 void medialist_set_album_view(bool on);
 
-// "Alternative album view": an album's tracks open under a head with its
-// cover, title, artist, genre and year and three buttons -- shuffle, play and a
-// track into the queue, circle-play's choices -- which scrolls away with the
-// rows. The page takes the sleeve's colour, and the rows carry track numbers
-// instead of covers. Off by default; Music > Library. On a record of more
-// than one disc there is a "Disc N" heading above the first track of each disc
-// either way.
+// The optional album layout adds one cover, album details and playback
+// controls, with numbered rows and track durations underneath.
 bool medialist_album_head(void);
 void medialist_set_album_head(bool on);
+bool medialist_album_head_muted(void);
+void medialist_set_album_head_muted(bool muted);
 
 // "Go to the current track": All tracks, Albums, Artists, Album artists and
 // Genres open scrolled to the row of what is playing -- the track itself in

@@ -7,7 +7,7 @@
 #include "src/gui/shell/theme.h"
 #include "src/system/core/lang.h"
 
-#define POPOVER_MAX_ITEMS 7
+#define POPOVER_MAX_ITEMS 8
 #define POPOVER_WIDTH 284
 #define POPOVER_ROW_HEIGHT 62
 #define POPOVER_RADIUS 16
@@ -65,6 +65,7 @@ void popover_init(void) {
 	card = lv_obj_create(veil);
 	lv_obj_set_width(card, POPOVER_WIDTH);
 	lv_obj_set_height(card, LV_SIZE_CONTENT);
+	lv_obj_set_style_max_height(card, lv_pct(94), 0);
 	lv_obj_add_style(card, &theme_style_card, 0);
 	lv_obj_set_style_radius(card, POPOVER_RADIUS, 0);
 	lv_obj_set_style_border_width(card, 0, 0);
@@ -72,7 +73,7 @@ void popover_init(void) {
 	lv_obj_set_style_pad_gap(card, 0, 0);
 	lv_obj_set_style_shadow_width(card, 0, 0);
 	lv_obj_set_flex_flow(card, LV_FLEX_FLOW_COLUMN);
-	lv_obj_set_scrollable(card, false);
+	lv_obj_set_scroll_dir(card, LV_DIR_VER);
 	// A tap on the card itself must not fall through to the veil.
 	lv_obj_set_event_bubble(card, false);
 }
@@ -168,6 +169,7 @@ void popover_show(lv_obj_t *anchor, const popover_item_t *items, int count) {
 	}
 
 	lv_obj_set_pos(card, x, y);
+	lv_obj_scroll_to_y(card, 0, LV_ANIM_OFF);
 
 	lv_obj_set_hidden(veil, false);
 	lv_obj_move_foreground(veil);

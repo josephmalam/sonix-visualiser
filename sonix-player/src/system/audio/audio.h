@@ -150,6 +150,10 @@ void audio_get_current_file(char *out, size_t out_size);
 
 void audio_get_progress(double *current_secs, double *total_secs);
 
+// Reads a local file or CUE track's duration without starting playback.
+// Returns zero when unavailable. Call from a worker.
+double audio_file_duration(const char *path);
+
 // Get the sample rate and channel count of the currently playing stream.
 // Both are 0 if nothing has started playing yet.
 void audio_get_stream_info(int *sample_rate, int *channels);

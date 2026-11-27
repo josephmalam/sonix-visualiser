@@ -5,7 +5,7 @@ Changes in this fork were vibe coded with Codex. I've tested on my HiBy R1 but I
 - Added a Stats home tile with listening time, charts and top artists, albums and tracks by week, month, year or all time; Streaming is now under More
 - Play counts can be shown throughout library track lists, with a yellow favourites indicator
 - Larger invisible touch targets for the Now Playing progress and Control Centre brightness sliders
-- Added a classic 'iTunes visualiser' mode
+- Added an audio-reactive visualiser with Ribbons and full-screen monochrome Pulse lines. Lower lines respond to bass and upper lines respond to treble.
 - Improved thumbnail loading times with some caching and pre-generation changes
 - CoverFlow artwork now loads instantly and I added fade-in-out so it looks smoother when scrolling
 - Album grid view: adds a 4 column cover art grid
