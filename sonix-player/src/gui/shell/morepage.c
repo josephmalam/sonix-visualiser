@@ -21,15 +21,15 @@ void morepage_init(gui_config_t *cfg) {
 	const grid_entry_t entries[] = {
 	    {"streaming", &icon_menu_streaming, &streaming_screen, NULL},
 	    {"dac", &icon_menu_dac, &dacpage_screen, NULL},
+	    // An action rather than a screen: the shelf reads the Ebook folder again
+	    // every time it is opened, so a book copied onto the card turns up
+	    // without a restart.
+	    {"books", &icon_menu_books, NULL, ebookpage_open},
 #if GB_CORE
 	    // The Game Boy emulator. Present only when the binary was built with
 	    // GB=1 (see the Makefile).
 	    {"gearboy", &icon_menu_gearboy, &gearboypage_screen, NULL},
 #endif
-	    // An action rather than a screen: the shelf reads the Ebook folder again
-	    // every time it is opened, so a book copied onto the card turns up
-	    // without a restart.
-	    {"books", &icon_menu_books, NULL, ebookpage_open},
 	    // An action for the same reason the shelf is one: the listing is read
 	    // when the page is entered, so a card that changed under the player
 	    // shows what is on it now.
